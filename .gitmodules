@@ -1,0 +1,6 @@
+[submodule "external/gello_software"]
+	path = external/gello_software
+	url = https://github.com/wuphilipp/gello_software.git
+[submodule "external/openpi"]
+	path = external/openpi
+	url = https://github.com/wut19/openpi.git

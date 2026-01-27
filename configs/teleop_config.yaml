@@ -1,0 +1,14 @@
+# Teleoperation and Control Configuration
+
+servoj:
+  time_step: 0.008        # Seconds (125Hz)
+  lookahead_time: 0.1     # Seconds [0.03, 0.2]
+  gain: 300               # [100, 2000]
+
+safety:
+  max_joint_velocity: 0.1 # Radians per step
+  safe_mode_default: true
+
+hand_poses:
+  open: [9.0, 50.0, 0.0,  0.0, 85.0, 0.0,  0.0, 90.0, 75.0,  0.0, 90.0, 75.0,  0.0, 90.0, 75.0]
+  close: [9.0, 55.0, 0.0,  0.0, 90.0, 0.0,  0.0, 90.0, 75.0,  0.0, 90.0, 75.0,  0.0, 90.0, 75.0]

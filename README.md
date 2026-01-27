@@ -17,20 +17,28 @@
 └── pyproject.toml          # Python 项目配置
 ```
 
-## 🛠️ 环境安装
+## 📦 安装与环境配置
 
-本项目依赖于 Anaconda 环境 `ssr_huawei`。
+本项目使用 `pyproject.toml` 进行标准的 Python 包管理。
 
-1. **激活环境**
-   ```bash
-   conda activate ssr_huawei
-   ```
+### 1. 创建环境 (可选)
+推荐使用 Conda 创建 Python 3.10 环境：
+```bash
+conda create -n ssr_env python=3.10
+conda activate ssr_env
+```
 
-2. **安装项目依赖**
-   在项目根目录下运行，以安装 `ssr` 包及其依赖（Editable 模式）：
-   ```bash
-   pip install -e .
-   ```
+### 2. 安装项目依赖
+在项目根目录下运行以下命令，将本项目以**可编辑模式 (Editable Mode)** 安装。这会自动读取 `pyproject.toml` 并安装所有必需的 Python 库 (numpy, opencv, python-can, 等)。
+
+```bash
+# 安装核心依赖
+pip install -e .
+
+# 或者安装包含开发工具 (pytest, black) 的完整依赖
+pip install -e .[dev]
+```
+
 
 ## ⚙️ 硬件配置
 

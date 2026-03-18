@@ -1,7 +1,7 @@
 # Hardware Configuration
 
 ur_arm:
-  ip: "192.168.1.5"
+  ip: "192.168.3.4"
 
 gello:
   port: "/dev/serial/by-id/usb-ROBOTIS_OpenRB-150_9321A3E850304A46462E3120FF0C1339-if00"

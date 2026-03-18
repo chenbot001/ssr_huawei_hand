@@ -28,7 +28,8 @@ wheels/
 .vscode/
 
 # Project specific
-demo/*.mp4
+demo/
+data/
 
 # OS
 .DS_Store

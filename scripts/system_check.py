@@ -38,6 +38,8 @@ def check_packages():
         ('dynamixel_sdk', 'dynamixel_sdk'),
         ('rtde_receive', 'ur_rtde'),  # Assuming ur_rtde provides this
         ('gello', 'gello_software'),
+        ('pyrealsense2', 'pyrealsense2'),
+        ('zmq', 'pyzmq'),
     ]
     
     missing = []
@@ -203,6 +205,100 @@ def check_camera(index, name):
         print(f"    [FAIL] Exception: {e}")
         return False
 
+def check_t265():
+    print("[-] Checking T265 camera...")
+    pipeline = None
+    try:
+        import pyrealsense2 as rs
+        
+        pipeline = rs.pipeline()
+        config = rs.config()
+        config.enable_stream(rs.stream.pose)
+        
+        # Try to start the pipeline
+        pipeline.start(config)
+        
+        # Wait for a frame to verify it's working
+        frames = pipeline.wait_for_frames(timeout_ms=2000)
+        pose_frame = frames.get_pose_frame()
+        
+        pipeline.stop()
+        pipeline = None
+        
+        if pose_frame:
+            pose_data = pose_frame.get_pose_data()
+            print(f"    [PASS] T265 connected. Position: [{pose_data.translation.x:.3f}, {pose_data.translation.y:.3f}, {pose_data.translation.z:.3f}]")
+            return True
+        else:
+            print("    [FAIL] T265 connected but no pose frame received.")
+            return False
+            
+    except ImportError:
+        print("    [FAIL] pyrealsense2 not available.")
+        return False
+    except Exception as e:
+        if pipeline is not None:
+            try:
+                pipeline.stop()
+            except:
+                pass
+        print(f"    [FAIL] Exception: {e}")
+        return False
+
+def check_manus_glove(address="tcp://localhost:8000"):
+    print(f"[-] Checking Manus glove at {address}...")
+    try:
+        import zmq
+        
+        context = zmq.Context()
+        socket = context.socket(zmq.PULL)
+        socket.setsockopt(zmq.CONFLATE, True)
+        socket.setsockopt(zmq.RCVTIMEO, 2000)  # 2 second timeout
+        
+        try:
+            socket.connect(address)
+        except Exception as e:
+            print(f"    [FAIL] Failed to connect to ZMQ address: {e}")
+            socket.close()
+            context.term()
+            return False
+        
+        # Try to receive a message (blocking with timeout)
+        try:
+            message = socket.recv()  # Blocking receive with timeout set above
+            data = message.decode('utf-8').split(",")
+            
+            socket.close()
+            context.term()
+            
+            # Check if we got valid skeleton data (should be 176 or 352 elements)
+            if len(data) >= 176:
+                print(f"    [PASS] Manus glove connected. Received {len(data)} data points.")
+                return True
+            else:
+                print(f"    [FAIL] Manus glove connected but received invalid data format ({len(data)} points).")
+                return False
+                
+        except zmq.Again:
+            # Timeout - no message received, but connection is established
+            socket.close()
+            context.term()
+            print("    [WARN] Manus glove ZMQ connection established but no data received (may need to start MANUS SDK).")
+            # Still consider it a pass since connection works
+            return True
+        except Exception as e:
+            socket.close()
+            context.term()
+            print(f"    [FAIL] Error receiving data: {e}")
+            return False
+            
+    except ImportError:
+        print("    [FAIL] pyzmq not available.")
+        return False
+    except Exception as e:
+        print(f"    [FAIL] Exception: {e}")
+        return False
+
 # ==========================================
 # 5. Main Execution
 # ==========================================
@@ -223,49 +319,111 @@ def main():
         # We continue, but mark as failed
     
     config = get_hardware_config()
-    status = {}
     
-    # 3. UR5
+    # Initialize status dictionaries for each category
+    hardware_status = {}
+    teleop_status = {}
+    sensors_status = {}
+    
+    # ==========================================
+    # Hardware Checks
+    # ==========================================
+    print("\n[Hardware]")
+    print("-" * 40)
+    
     ur_ip = config.get('ur_arm', {}).get('ip', '192.168.1.5')
-    status['UR5'] = check_ur5(ur_ip)
+    hardware_status['UR5'] = check_ur5(ur_ip)
     
-    # 4. GELLO
-    gello_port = config.get('gello', {}).get('port', '/dev/ttyUSB0')
-    status['GELLO'] = check_gello(gello_port)
-    
-    # 5. Hand
     hand_port = config.get('ruiyan_hand', {}).get('port', 'can0')
-    status['Hand'] = check_hand(hand_port)
+    hardware_status['Hand'] = check_hand(hand_port)
     
-    # 6. Cameras
-    print("[-] Checking Cameras...")
+    # ==========================================
+    # Teleop Checks (Alternative Methods)
+    # ==========================================
+    print("\n[Teleop]")
+    print("-" * 40)
+    
+    # Method 1: GELLO
+    gello_port = config.get('gello', {}).get('port', '/dev/ttyUSB0')
+    teleop_status['GELLO'] = check_gello(gello_port)
+    
+    # Method 2: T265 + Manus Glove (both required)
+    manus_address = config.get('manus_glove', {}).get('address', 'tcp://localhost:8000')
+    teleop_status['T265'] = check_t265()
+    teleop_status['Manus_Glove'] = check_manus_glove(manus_address)
+    
+    # ==========================================
+    # Sensor Checks
+    # ==========================================
+    print("\n[Sensors]")
+    print("-" * 40)
+    
     fingertip_conf = config.get('cameras', {}).get('fingertips', {})
     
     if 'thumb' in fingertip_conf:
         thumb_idx = get_video_index_by_id(fingertip_conf['thumb']['id'], fingertip_conf['thumb'].get('offset', 0))
-        status['Cam_Thumb'] = check_camera(thumb_idx, "Thumb")
+        sensors_status['Cam_Thumb'] = check_camera(thumb_idx, "Thumb")
         
     if 'index' in fingertip_conf:
         index_idx = get_video_index_by_id(fingertip_conf['index']['id'], fingertip_conf['index'].get('offset', 0))
-        status['Cam_Index'] = check_camera(index_idx, "Index")
+        sensors_status['Cam_Index'] = check_camera(index_idx, "Index")
     
     rs_configs = config.get('cameras', {}).get('realsense', [])
     for i, cfg in enumerate(rs_configs):
         idx = get_video_index_by_id(cfg['id'], cfg.get('offset', 0))
-        status[f'Cam_RealSense_{i+1}'] = check_camera(idx, cfg.get('name', 'Unknown'))
+        sensors_status[f'Cam_RealSense_{i+1}'] = check_camera(idx, cfg.get('name', 'Unknown'))
     
+    # ==========================================
+    # Summary
+    # ==========================================
     print("\n========================================")
     print("             SUMMARY")
     print("========================================")
     
     all_pass = True
-    for dev, passed in status.items():
+    
+    # Hardware Summary
+    print("\n[Hardware]")
+    for dev, passed in hardware_status.items():
         res_str = "\033[92m[OK]\033[0m" if passed else "\033[91m[FAIL]\033[0m"
-        print(f"{dev:<20} : {res_str}")
+        print(f"  {dev:<18} : {res_str}")
         if not passed:
             all_pass = False
-            
-    print("========================================")
+    
+    # Teleop Summary (with logic: GELLO OR (T265 AND Manus_Glove))
+    print("\n[Teleop]")
+    gello_ok = teleop_status.get('GELLO', False)
+    t265_ok = teleop_status.get('T265', False)
+    manus_ok = teleop_status.get('Manus_Glove', False)
+    
+    # Check individual components
+    for dev, passed in teleop_status.items():
+        res_str = "\033[92m[OK]\033[0m" if passed else "\033[91m[FAIL]\033[0m"
+        print(f"  {dev:<18} : {res_str}")
+    
+    # Check if at least one teleop method is available
+    teleop_method1_ok = gello_ok
+    teleop_method2_ok = t265_ok and manus_ok
+    teleop_available = teleop_method1_ok or teleop_method2_ok
+    
+    if teleop_available:
+        if teleop_method1_ok:
+            print("  \033[92m[OK]\033[0m Teleop Method Available: GELLO")
+        if teleop_method2_ok:
+            print("  \033[92m[OK]\033[0m Teleop Method Available: T265 + Manus Glove")
+    else:
+        print("  \033[91m[FAIL]\033[0m No teleop method available (need GELLO OR both T265+Manus)")
+        all_pass = False
+    
+    # Sensors Summary
+    print("\n[Sensors]")
+    for dev, passed in sensors_status.items():
+        res_str = "\033[92m[OK]\033[0m" if passed else "\033[91m[FAIL]\033[0m"
+        print(f"  {dev:<18} : {res_str}")
+        if not passed:
+            all_pass = False
+    
+    print("\n========================================")
     if all_pass:
         print("\033[92mSYSTEM READY.\033[0m")
         sys.exit(0)

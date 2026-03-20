@@ -21,18 +21,25 @@ import numpy as np
 import pyrealsense2 as rs
 from pynput import keyboard
 from ssr.hardware.arm_ur5 import UR5Arm
-from ssr.config import get_hardware_config
+from ssr.config import get_hardware_config, get_teleop_config
 from scipy.spatial.transform import Rotation as R
 
 # ============================================================================
-# 配置 (Configuration)
+# 配置 (从 configs/ 加载)
 # ============================================================================
-# 从硬件配置加载UR机械臂IP
 ROBOT_IP = get_hardware_config()['ur_arm']['ip']
 
-# 平移和旋转缩放因子
-TRANSLATION_SCALE = 1.0  # 1.0表示T265移动1米=机械臂移动1米
+_teleop_config = get_teleop_config()
+_servo_cfg = _teleop_config.get('servo', {})
+_t265_cfg = _teleop_config.get('t265', {})
+
+TRANSLATION_SCALE = _t265_cfg.get('translation_scale', 1.0)
 ROTATION_SCALE = 1.0
+SERVO_SPEED = _servo_cfg.get('speed', 0.5)
+SERVO_ACCEL = _servo_cfg.get('acceleration', 0.5)
+SERVO_DT = _servo_cfg.get('dt', 0.002)
+SERVO_LOOKAHEAD = _servo_cfg.get('lookahead_time', 0.1)
+SERVO_GAIN = _servo_cfg.get('gain', 300)
 
 # 坐标对齐矩阵: 将T265坐标系映射到UR机械臂坐标系
 # 修复前后和上下运动反转的问题:
@@ -219,7 +226,7 @@ def main():
                 # 6. 发送指令至UR机械臂 (通过servoL)
                 # servoL(位姿, 速度, 加速度, 间隔dt, 预测前瞻延时, 增益系数)
                 try:
-                    ur_arm.rtde_c.servoL(target_pose_vec, 0.5, 0.5, 0.002, 0.1, 300)
+                    ur_arm.rtde_c.servoL(target_pose_vec, SERVO_SPEED, SERVO_ACCEL, SERVO_DT, SERVO_LOOKAHEAD, SERVO_GAIN)
                 except Exception as e:
                     print(f"发送servoL命令出错: {e}")
                     

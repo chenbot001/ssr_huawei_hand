@@ -66,11 +66,12 @@ python scripts/run_teleop.py
 
 ### 3. 组件独立测试
 如果遇到问题，可以使用以下脚本单独测试各个组件：
-*   **机械臂**: `python scripts/test_ur5.py`
-*   **灵巧手**: `python scripts/test_hand.py`
-*   **GELLO**: `python scripts/test_gello.py`
-*   **指尖视触觉**: `python scripts/test_tactile.py` 
-*   **RealSense**: `python scripts/test_realsense.py`
+*   **机械臂**: `python scripts/sys_test/test_ur5.py`
+*   **灵巧手**: `python scripts/sys_test/test_hand.py`
+*   **GELLO**: `python scripts/sys_test/test_gello.py`
+*   **指尖视触觉**: `python scripts/sys_test/test_tactile.py` 
+*   **RealSense 连接测试**: `python scripts/sys_test/test_realsense.py`
+*   **RealSense 相机绑定**: `python scripts/sys_test/assign_cam.py`
 
 ## 🔧 故障排除
 

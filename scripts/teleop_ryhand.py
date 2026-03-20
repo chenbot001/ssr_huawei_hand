@@ -29,7 +29,7 @@ import zmq
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(current_dir)
 src_path = os.path.join(project_root, "src")
-bidex_path = os.path.join(project_root, "Bidex_Manus_Teleop", "python")
+bidex_path = os.path.join(project_root, "external", "Bidex_Manus_Teleop", "python")
 
 if src_path not in sys.path:
     sys.path.append(src_path)
@@ -41,7 +41,7 @@ os.chdir(project_root)
 
 try:
     from ssr.hardware.ruiyan_driver import RyHandController
-    from ssr.config import get_hardware_config
+    from ssr.config import get_hardware_config, get_teleop_config
 except ImportError as e:
     print(f"导入错误: {e}")
     print("请确保已安装ssr包。")
@@ -172,10 +172,12 @@ class KalmanFilter1D:
 
         return self.x_hat
 
-# ============== 全局配置项 ==============
-IP_ADDRESS = "tcp://localhost:8000"
-LEFT_GLOVE_SN = "4848debd"
-RIGHT_GLOVE_SN = "db397317"
+# ============== 全局配置项 (从 configs/hardware_config.yaml 加载) ==============
+_hw_config = get_hardware_config()
+_manus_config = _hw_config.get('manus_glove', {})
+IP_ADDRESS = _manus_config.get('address', "tcp://localhost:8000")
+LEFT_GLOVE_SN = _manus_config.get('left_sn', "4848debd")
+RIGHT_GLOVE_SN = _manus_config.get('right_sn', "db397317")
 
 # 数据结构相关常数
 NUM_JOINTS = 25
@@ -186,7 +188,7 @@ VALUES_PER_JOINT = 7  # 坐标+四元数: x, y, z, qx, qy, qz, qw
 SHORT_IDX = [23, 24, 4, 5, 9, 10, 19, 20, 14, 15]
 
 # 从手套到RYHand的缩放与偏置缩放系数调整映射路径
-CALIBRATION_FILE = os.path.join(project_root, "manus_calibration.json")
+CALIBRATION_FILE = os.path.join(project_root, "configs", "manus_calibration.json")
 
 # 万一json无法读取，使用此回退默认值
 FINGER_SCALES = [1.0, 1.0, 1.0, 1.0, 1.0]
@@ -370,7 +372,7 @@ class RYHandIK:
         p.setRealTimeSimulation(0)
         
         # 加载左手机械手描述文件模型 (Ruihand Left URDF)
-        urdf_path = os.path.join(project_root, "Bidex_Manus_Teleop", "ryhand_left", "ruihand15z.urdf")
+        urdf_path = os.path.join(project_root, "external", "Bidex_Manus_Teleop", "ryhand_left", "ruihand15z.urdf")
         
         # 建立世界基座及原生初始90度翻转补偿姿态
         base_pos = [0, 0, 0]
@@ -625,10 +627,19 @@ def ik_to_hand_angles(ik_joints):
 
 
 def main():
+    # 从 teleop_config.yaml 加载遥操参数
+    teleop_config = get_teleop_config()
+    control_cfg = teleop_config.get('control', {})
+    profiler_cfg = teleop_config.get('velocity_profiler', {})
+    
+    default_speed = control_cfg.get('hand_motor_speed', 1000)
+    default_reset_speed = control_cfg.get('hand_reset_speed', 500)
+    default_max_step = profiler_cfg.get('max_step', 0.15)
+    
     parser = argparse.ArgumentParser(description='MANUS手套遥操作映射到RYHand真机系统')
     parser.add_argument('--no-gui', action='store_true', help='关闭PyBullet后台可视化图形界面渲染')
     parser.add_argument('--rate', type=float, default=30.0, help='主闭环控制刷新率 Hz (默认: 30)')
-    parser.add_argument('--speed', type=int, default=1000, help='马达底层最大响应速度 (默认: 1000)')
+    parser.add_argument('--speed', type=int, default=default_speed, help=f'马达底层最大响应速度 (默认: {default_speed})')
     parser.add_argument('--print-joints', action='store_true', help='在终端动态打印实时输出的关节控制信息')
     parser.add_argument('--use-right', action='store_true', help='改用右手套的数据替代左手套(适配左右SN号挂错的情境)')
     parser.add_argument('--dry-run', action='store_true', help='测试或无头渲染运行模式（不发起物理机械手的串口/CAN通信，仅跑算法仿真）')
@@ -671,7 +682,7 @@ def main():
     connected = False
     
     # 初始化 S型(正弦) 运动速度规划器 (解决绝对位置电机的"微跳指令"与"急刹"物理抖动)
-    velocity_profiler = SinusoidalVelocityProfiler(max_step=0.15)
+    velocity_profiler = SinusoidalVelocityProfiler(max_step=default_max_step)
     
     try:
         last_time = time.time()
@@ -730,7 +741,7 @@ def main():
         # 断开释放前为保障下次上电无突波事故,强制令实际机构柔顺重置全关节到开合基准位(全零张量位) 
         if hand_controller is not None:
             print("[硬件层] 激活机构退网断电保护守卫功能: 下发全手指放平清零操作复位动作...")
-            hand_controller.set_angles(np.zeros(15), speed=500, radians=True)
+            hand_controller.set_angles(np.zeros(15), speed=default_reset_speed, radians=True)
             time.sleep(0.5)
             hand_controller.close()
         

@@ -34,6 +34,7 @@
 """
 
 import argparse
+import glob
 import os
 import sys
 import time
@@ -139,7 +140,9 @@ def replay_episode(ur_arm, hand_ctrl, data, ep_len, args):
     has_hand_angles = 'hand_joint_angles' in data
     has_action_hand = 'action_hand_joints' in data
     has_action_delta = 'action_eef_delta' in data
-    has_camera = 'camera_0' in data
+    has_camera_env = 'camera_env' in data
+    has_camera_wrist = 'camera_wrist' in data
+    has_camera = has_camera_env or has_camera_wrist
 
     control_dt = 1.0 / args.rate
     speed_factor = args.speed
@@ -264,49 +267,126 @@ def replay_episode(ur_arm, hand_ctrl, data, ep_len, args):
                         if step % 50 == 0:
                             print(f"\n  [WARN] 手部第 {step} 步出错: {e}")
 
-            # ------ 可视化 ------
+            # ------ 可视化 (三栏: Wrist | Env | Stats) ------
             if show_vis:
-                frame = data['camera_0'][step].copy()
-                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                panel_w, panel_h = 400, 360
 
-                # 放大
-                h, w = frame.shape[:2]
-                frame = cv2.resize(frame, (w * 2, h * 2),
-                                   interpolation=cv2.INTER_LINEAR)
+                # — 左栏: Wrist 相机 —
+                if has_camera_wrist:
+                    wrist_frame = data['camera_wrist'][step].copy()
+                    wrist_frame = cv2.cvtColor(wrist_frame, cv2.COLOR_RGB2BGR)
+                    wrist_panel = cv2.resize(wrist_frame, (panel_w, panel_h),
+                                             interpolation=cv2.INTER_LINEAR)
+                else:
+                    wrist_panel = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
+                    cv2.putText(wrist_panel, "Wrist: N/A",
+                                (panel_w // 2 - 70, panel_h // 2),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                (100, 100, 100), 2)
 
-                # 叠加信息文字
-                info_lines = [
-                    f"Step: {step+1}/{ep_len}  Speed: x{speed_factor:.1f}",
-                ]
+                # — 中栏: Env 相机 —
+                if has_camera_env:
+                    env_frame = data['camera_env'][step].copy()
+                    env_frame = cv2.cvtColor(env_frame, cv2.COLOR_RGB2BGR)
+                    env_panel = cv2.resize(env_frame, (panel_w, panel_h),
+                                           interpolation=cv2.INTER_LINEAR)
+                else:
+                    env_panel = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
+                    cv2.putText(env_panel, "Env: N/A",
+                                (panel_w // 2 - 55, panel_h // 2),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                (100, 100, 100), 2)
+
+                # — 右栏: 数值信息面板 —
+                stats_panel = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                y0 = 30
+                dy = 24
+
+                def _put(text, y, color=(220, 220, 220), scale=0.50, thick=1):
+                    cv2.putText(stats_panel, text, (12, y),
+                                font, scale, color, thick)
+
+                _put(f"Step: {step+1} / {ep_len}", y0,
+                     color=(0, 255, 0), scale=0.60, thick=2)
+                _put(f"Speed: x{speed_factor:.1f}  |  Rate: {args.rate} Hz",
+                     y0 + dy)
+
+                line_y = y0 + dy * 2 + 8
+                cv2.line(stats_panel, (10, line_y), (panel_w - 10, line_y),
+                         (60, 60, 60), 1)
+
+                cy = line_y + dy
                 if has_arm_pose:
                     ap = data['arm_eef_pose'][step]
-                    info_lines.append(
-                        f"Arm: [{ap[0]:.3f},{ap[1]:.3f},{ap[2]:.3f}]")
-                if has_action_hand:
-                    ah = np.rad2deg(data['action_hand_joints'][step])
-                    info_lines.append(
-                        f"Hand: [{ah[0]:.0f},{ah[1]:.0f},{ah[2]:.0f},...]")
+                    _put("Arm EEF Pose:", cy, color=(180, 220, 255))
+                    cy += dy
+                    _put(f"  pos  [{ap[0]:+.4f}, {ap[1]:+.4f}, {ap[2]:+.4f}]",
+                         cy)
+                    cy += dy
+                    _put(f"  rot  [{ap[3]:+.4f}, {ap[4]:+.4f}, {ap[5]:+.4f}]",
+                         cy)
+                    cy += dy + 4
+
                 if has_action_delta:
                     ad = data['action_eef_delta'][step]
-                    info_lines.append(
-                        f"Delta: [{ad[0]:.4f},{ad[1]:.4f},{ad[2]:.4f}]")
+                    _put("Action EEF Delta:", cy, color=(180, 220, 255))
+                    cy += dy
+                    _put(f"  dpos [{ad[0]:+.5f}, {ad[1]:+.5f}, {ad[2]:+.5f}]",
+                         cy)
+                    cy += dy
+                    _put(f"  drot [{ad[3]:+.5f}, {ad[4]:+.5f}, {ad[5]:+.5f}]",
+                         cy)
+                    cy += dy + 4
 
-                for i, line in enumerate(info_lines):
-                    cv2.putText(frame, line, (10, 25 + i * 25),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                                (0, 255, 0), 1)
+                if has_hand_angles:
+                    hj = np.rad2deg(data['hand_joint_angles'][step])
+                    _put("Hand Joints (deg):", cy, color=(180, 220, 255))
+                    cy += dy
+                    _put(f"  Thumb  [{hj[0]:+5.1f},{hj[1]:+5.1f},{hj[2]:+5.1f}]",
+                         cy)
+                    cy += dy
+                    _put(f"  Index  [{hj[3]:+5.1f},{hj[4]:+5.1f},{hj[5]:+5.1f}]",
+                         cy)
+                    cy += dy
+                    _put(f"  Mid    [{hj[6]:+5.1f},{hj[7]:+5.1f},{hj[8]:+5.1f}]",
+                         cy)
+                    cy += dy
+                    _put(f"  Ring   [{hj[9]:+5.1f},{hj[10]:+5.1f},{hj[11]:+5.1f}]",
+                         cy)
+                    cy += dy
+                    _put(f"  Pinky  [{hj[12]:+5.1f},{hj[13]:+5.1f},{hj[14]:+5.1f}]",
+                         cy)
+                    cy += dy + 4
 
-                # 进度条
-                fh, fw = frame.shape[:2]
-                bar_y = fh - 15
+                if has_action_hand:
+                    ah = np.rad2deg(data['action_hand_joints'][step])
+                    _put("Action Hand (deg):", cy, color=(180, 220, 255))
+                    cy += dy
+                    _put(f"  [{ah[0]:+5.1f},{ah[1]:+5.1f},{ah[2]:+5.1f},...,"
+                         f"{ah[12]:+5.1f},{ah[13]:+5.1f},{ah[14]:+5.1f}]", cy)
+
+                # 面板标签
+                cv2.putText(wrist_panel, "WRIST", (10, 25),
+                            font, 0.65, (0, 200, 255), 2)
+                cv2.putText(env_panel, "ENV", (10, 25),
+                            font, 0.65, (0, 200, 255), 2)
+
+                # 拼接三栏
+                canvas = np.hstack([wrist_panel, env_panel, stats_panel])
+
+                # 底部进度条 (跨越整个画布)
+                total_w = canvas.shape[1]
+                bar_y = canvas.shape[0] - 12
                 progress = step / max(ep_len - 1, 1)
-                cv2.rectangle(frame, (10, bar_y), (fw - 10, bar_y + 8),
+                cv2.rectangle(canvas, (8, bar_y),
+                              (total_w - 8, bar_y + 6),
                               (60, 60, 60), -1)
-                cv2.rectangle(frame, (10, bar_y),
-                              (10 + int((fw - 20) * progress), bar_y + 8),
+                cv2.rectangle(canvas, (8, bar_y),
+                              (8 + int((total_w - 16) * progress), bar_y + 6),
                               (0, 200, 0), -1)
 
-                cv2.imshow(window_name, frame)
+                cv2.imshow(window_name, canvas)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q') or key == 27:
                     print(f"\n  用户中断 (第 {step+1} 步)")
@@ -366,9 +446,9 @@ def replay_episode(ur_arm, hand_ctrl, data, ep_len, args):
 def main():
     parser = argparse.ArgumentParser(
         description="数据回放脚本 — 在真实硬件上回放采集的轨迹")
-    parser.add_argument("zarr_path", type=str,
-                        help="zarr 数据集路径")
-    parser.add_argument("--episode", "-e", type=int, default=1,
+    parser.add_argument("zarr_path", type=str, nargs="?", default=None,
+                        help="zarr 数据集路径 (省略则自动选择 data/ 下最新的 .zarr 数据集)")
+    parser.add_argument("--episode", "-e", type=int, default=None,
                         help="要回放的 episode 编号, 从 1 开始 (默认 1)")
     parser.add_argument("--rate", type=float, default=15.0,
                         help="回放控制频率 Hz (应与采集时一致, 默认 15)")
@@ -391,7 +471,19 @@ def main():
                         help="循环回放直到手动停止")
     args = parser.parse_args()
 
-    zarr_path = os.path.expanduser(args.zarr_path)
+    # --- 自动发现最新 zarr 数据集 ---
+    if args.zarr_path is None:
+        data_dir = os.path.join(project_root, "data")
+        candidates = sorted(glob.glob(os.path.join(data_dir, "*.zarr")),
+                             key=os.path.getmtime)
+        if not candidates:
+            print(f"[ERROR] data/ 目录下未找到任何 .zarr 数据集")
+            sys.exit(1)
+        zarr_path = candidates[-1]  # 最新修改的
+        print(f"[自动选择] 最新数据集: {zarr_path}")
+    else:
+        zarr_path = os.path.expanduser(args.zarr_path)
+
     if not os.path.exists(zarr_path):
         print(f"[ERROR] 路径不存在: {zarr_path}")
         sys.exit(1)
@@ -405,6 +497,11 @@ def main():
 
     if args.info:
         return
+
+    # --- 默认回放最新 episode ---
+    if args.episode is None:
+        args.episode = rb.n_episodes  # 最后一个 episode
+        print(f"[自动选择] 回放最新 episode: {args.episode}")
 
     # 验证 episode 编号
     ep_idx = args.episode - 1

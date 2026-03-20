@@ -178,10 +178,17 @@ class RyHand:
                     # Feed to C library
                     self.lib.RyCanServoLibRcvMsg(ctypes.byref(self.bus_struct), c_msg)
             except Exception as e:
+                if not self.running:
+                    break  # Suppress errors during shutdown
                 print(f"RX Error: {e}")
 
     def close(self):
         self.running = False
+        # Wait for background threads to finish before destroying the bus
+        if hasattr(self, 'rx_thread') and self.rx_thread.is_alive():
+            self.rx_thread.join(timeout=0.5)
+        if hasattr(self, 'timer_thread') and self.timer_thread.is_alive():
+            self.timer_thread.join(timeout=0.5)
         if self.bus_hw:
             self.bus_hw.shutdown()
 

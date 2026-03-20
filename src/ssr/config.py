@@ -33,6 +33,3 @@ def get_teleop_config():
 # Helper accessors for backward compatibility or ease of use
 def get_ur_ip():
     return get_hardware_config()['ur_arm']['ip']
-
-def get_gello_port():
-    return get_hardware_config()['gello']['port']

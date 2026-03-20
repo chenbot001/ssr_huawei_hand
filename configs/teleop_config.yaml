@@ -1,14 +1,27 @@
 # Teleoperation and Control Configuration
 
-servoj:
-  time_step: 0.008        # Seconds (125Hz)
-  lookahead_time: 0.1     # Seconds [0.03, 0.2]
-  gain: 300               # [100, 2000]
+servo:
+  # servoL parameters (Cartesian space)
+  speed: 0.5
+  acceleration: 0.5
+  dt: 0.002
+  lookahead_time: 0.1
+  gain: 300
 
-safety:
-  max_joint_velocity: 0.1 # Radians per step
-  safe_mode_default: true
+t265:
+  translation_scale: 1.0
 
-hand_poses:
-  open: [9.0, 50.0, 0.0,  0.0, 85.0, 0.0,  0.0, 90.0, 75.0,  0.0, 90.0, 75.0,  0.0, 90.0, 75.0]
-  close: [9.0, 55.0, 0.0,  0.0, 90.0, 0.0,  0.0, 90.0, 75.0,  0.0, 90.0, 75.0,  0.0, 90.0, 75.0]
+control:
+  update_rate: 80.0          # Hz
+  hand_motor_speed: 1000     # operating speed
+  hand_reset_speed: 500      # speed when resetting to zero
+
+velocity_profiler:
+  max_step: 0.15
+
+start_pose:
+  # UR5 joint angles (radians) for the initial / reset position
+  # Corresponds to [0, -90, -110, -160, -90, 100] degrees
+  arm_joints: [0.0, -1.5708, -1.9199, -2.7925, -1.5708, 1.7453]
+  move_speed: 0.5            # moveJ speed (rad/s)
+  move_acceleration: 0.5     # moveJ acceleration (rad/s²)

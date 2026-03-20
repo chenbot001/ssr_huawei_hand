@@ -28,20 +28,22 @@ from scipy.spatial.transform import Rotation as R
 
 from ssr.hardware.arm_ur5 import UR5Arm
 from ssr.hardware.ruiyan_driver import RyHandController
-from ssr.config import get_hardware_config
+from ssr.config import get_hardware_config, get_teleop_config
 
 # ============================================================================
-# 手套和手部配置 (Glove & Hand Config)
+# 手套和手部配置 (从 configs/hardware_config.yaml 加载)
 # ============================================================================
-IP_ADDRESS = "tcp://localhost:8000"
-LEFT_GLOVE_SN = "4848debd"
-RIGHT_GLOVE_SN = "db397317"
+_hw_config = get_hardware_config()
+_manus_config = _hw_config.get('manus_glove', {})
+IP_ADDRESS = _manus_config.get('address', "tcp://localhost:8000")
+LEFT_GLOVE_SN = _manus_config.get('left_sn', "4848debd")
+RIGHT_GLOVE_SN = _manus_config.get('right_sn', "db397317")
 
 NUM_JOINTS = 25
 VALUES_PER_JOINT = 7
 SHORT_IDX = [23, 24, 4, 5, 9, 10, 19, 20, 14, 15]
 
-CALIBRATION_FILE = os.path.join(project_root, "manus_calibration.json")
+CALIBRATION_FILE = os.path.join(project_root, "configs", "manus_calibration.json")
 FINGER_SCALES = [1.0, 1.0, 1.0, 1.0, 1.0]
 WRIST_OFFSET = [0.0, 0.0, 0.0]
 FINGER_POS_OFFSETS = [[0.0, 0.0, 0.0] for _ in range(5)]
@@ -58,9 +60,24 @@ if os.path.exists(CALIBRATION_FILE):
         print(f"[初始化] 加载校准文件失败: {e}")
 
 # ============================================================================
-# 机械臂和T265配置 (Arm & T265 Config)
+# 机械臂和T265配置 (从 configs/teleop_config.yaml 加载)
 # ============================================================================
-TRANSLATION_SCALE = 1.0
+_teleop_config = get_teleop_config()
+_servo_cfg = _teleop_config.get('servo', {})
+_t265_cfg = _teleop_config.get('t265', {})
+_control_cfg = _teleop_config.get('control', {})
+_profiler_cfg = _teleop_config.get('velocity_profiler', {})
+
+TRANSLATION_SCALE = _t265_cfg.get('translation_scale', 1.0)
+SERVO_SPEED = _servo_cfg.get('speed', 0.5)
+SERVO_ACCEL = _servo_cfg.get('acceleration', 0.5)
+SERVO_DT = _servo_cfg.get('dt', 0.002)
+SERVO_LOOKAHEAD = _servo_cfg.get('lookahead_time', 0.1)
+SERVO_GAIN = _servo_cfg.get('gain', 300)
+CONTROL_UPDATE_RATE = _control_cfg.get('update_rate', 80.0)
+HAND_MOTOR_SPEED = _control_cfg.get('hand_motor_speed', 1000)
+HAND_RESET_SPEED = _control_cfg.get('hand_reset_speed', 500)
+PROFILER_MAX_STEP = _profiler_cfg.get('max_step', 0.15)
 T265_TO_UR_ALIGN = np.array([
     [ 0,  0, -1,  0],
     [-1,  0,  0,  0],
@@ -191,7 +208,7 @@ class RYHandIK:
         p.setGravity(0, 0, 0)
         p.setRealTimeSimulation(0)
         
-        urdf_path = os.path.join(project_root, "Bidex_Manus_Teleop", "ryhand_left", "ruihand15z.urdf")
+        urdf_path = os.path.join(project_root, "external", "Bidex_Manus_Teleop", "ryhand_left", "ruihand15z.urdf")
         self.robot_id = p.loadURDF(urdf_path, [0, 0, 0], p.getQuaternionFromEuler([0, 0, np.pi/2]), useFixedBase=True)
         
         self.actuated_joints = []
@@ -357,7 +374,7 @@ def main():
     print("[系统] 初始化手部控制模块...")
     glove_receiver = GloveDataReceiver()
     ryhand_ik = RYHandIK()
-    velocity_profiler = SinusoidalVelocityProfiler(max_step=0.15)
+    velocity_profiler = SinusoidalVelocityProfiler(max_step=PROFILER_MAX_STEP)
     
     hand_controller = None
     try:
@@ -405,7 +422,7 @@ def main():
         return
 
     was_clutch_active = False
-    update_interval = 1.0 / 80.0  # 默认30Hz控制频率
+    update_interval = 1.0 / CONTROL_UPDATE_RATE
     connected = False
     
     try:
@@ -436,7 +453,7 @@ def main():
                     profiled_hand_angles = hand_angles
                     
                     if hand_controller:
-                        hand_controller.set_angles(profiled_hand_angles, speed=1000, radians=True)
+                        hand_controller.set_angles(profiled_hand_angles, speed=HAND_MOTOR_SPEED, radians=True)
             else:
                 print("空载或数据断流水位: 正待机监控骨骼坐标系传入管线...", end='\r')
 
@@ -477,7 +494,7 @@ def main():
                         target_ur_matrix[:3, 3] = clutch_ur_matrix[:3, 3] + mapped_trans_delta
                         
                         try:
-                            ur_arm.rtde_c.servoL(matrix_to_pose_vector(target_ur_matrix), 0.5, 0.5, 0.002, 0.1, 300)
+                            ur_arm.rtde_c.servoL(matrix_to_pose_vector(target_ur_matrix), SERVO_SPEED, SERVO_ACCEL, SERVO_DT, SERVO_LOOKAHEAD, SERVO_GAIN)
                         except Exception:
                             pass
                     else:
@@ -496,7 +513,7 @@ def main():
     finally:
         if hand_controller:
             print("[系统] 重置机械手至初始状态...")
-            hand_controller.set_angles(np.zeros(15), speed=500, radians=True)
+            hand_controller.set_angles(np.zeros(15), speed=HAND_RESET_SPEED, radians=True)
             time.sleep(0.5)
             hand_controller.close()
         if 'ur_arm' in locals() and ur_arm:

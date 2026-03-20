@@ -15,11 +15,9 @@ import numpy as np
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(current_dir)
 src_path = os.path.join(project_root, "src")
-external_gello = os.path.join(project_root, "external", "gello_software")
-dynamixel_sdk_path = os.path.join(external_gello, "third_party", "DynamixelSDK", "python", "src")
 
 # Add paths to sys.path
-paths_to_add = [src_path, project_root, external_gello, dynamixel_sdk_path]
+paths_to_add = [src_path, project_root]
 for p in paths_to_add:
     if p not in sys.path:
         sys.path.append(p)
@@ -35,9 +33,7 @@ def check_packages():
     packages = [
         ('cv2', 'opencv-python'),
         ('numpy', 'numpy'),
-        ('dynamixel_sdk', 'dynamixel_sdk'),
-        ('rtde_receive', 'ur_rtde'),  # Assuming ur_rtde provides this
-        ('gello', 'gello_software'),
+        ('rtde_receive', 'ur_rtde'),
         ('pyrealsense2', 'pyrealsense2'),
         ('zmq', 'pyzmq'),
     ]
@@ -108,7 +104,6 @@ def ensure_can_interface():
 try:
     from ssr.config import get_hardware_config
     import rtde_receive
-    from gello.agents.gello_agent import GelloAgent
     from ssr.hardware.ruiyan_driver import RyHandController
     from ssr.utils.camera_utils import get_video_index_by_id
 except ImportError as e:
@@ -137,23 +132,6 @@ def check_ur5(ip):
         else:
             print("    [FAIL] Port 30003 unreachable.")
             return False
-    except Exception as e:
-        print(f"    [FAIL] Exception: {e}")
-        return False
-
-def check_gello(port):
-    print(f"[-] Checking GELLO at {port}...")
-    try:
-        if not os.path.exists(port):
-             print(f"    [FAIL] Port does not exist.")
-             return False
-        
-        # Use simple serial check or GelloAgent
-        # Using GelloAgent confirms dependencies work too
-        agent = GelloAgent(port=port)
-        act = agent.act({})
-        print(f"    [PASS] Read success. Joints: {len(act)}")
-        return True
     except Exception as e:
         print(f"    [FAIL] Exception: {e}")
         return False
@@ -338,16 +316,11 @@ def main():
     hardware_status['Hand'] = check_hand(hand_port)
     
     # ==========================================
-    # Teleop Checks (Alternative Methods)
+    # Teleop Checks (T265 + Manus Glove)
     # ==========================================
     print("\n[Teleop]")
     print("-" * 40)
     
-    # Method 1: GELLO
-    gello_port = config.get('gello', {}).get('port', '/dev/ttyUSB0')
-    teleop_status['GELLO'] = check_gello(gello_port)
-    
-    # Method 2: T265 + Manus Glove (both required)
     manus_address = config.get('manus_glove', {}).get('address', 'tcp://localhost:8000')
     teleop_status['T265'] = check_t265()
     teleop_status['Manus_Glove'] = check_manus_glove(manus_address)
@@ -390,29 +363,21 @@ def main():
         if not passed:
             all_pass = False
     
-    # Teleop Summary (with logic: GELLO OR (T265 AND Manus_Glove))
+    # Teleop Summary (T265 AND Manus_Glove both required)
     print("\n[Teleop]")
-    gello_ok = teleop_status.get('GELLO', False)
     t265_ok = teleop_status.get('T265', False)
     manus_ok = teleop_status.get('Manus_Glove', False)
     
-    # Check individual components
     for dev, passed in teleop_status.items():
         res_str = "\033[92m[OK]\033[0m" if passed else "\033[91m[FAIL]\033[0m"
         print(f"  {dev:<18} : {res_str}")
     
-    # Check if at least one teleop method is available
-    teleop_method1_ok = gello_ok
-    teleop_method2_ok = t265_ok and manus_ok
-    teleop_available = teleop_method1_ok or teleop_method2_ok
+    teleop_available = t265_ok and manus_ok
     
     if teleop_available:
-        if teleop_method1_ok:
-            print("  \033[92m[OK]\033[0m Teleop Method Available: GELLO")
-        if teleop_method2_ok:
-            print("  \033[92m[OK]\033[0m Teleop Method Available: T265 + Manus Glove")
+        print("  \033[92m[OK]\033[0m Teleop Method Available: T265 + Manus Glove")
     else:
-        print("  \033[91m[FAIL]\033[0m No teleop method available (need GELLO OR both T265+Manus)")
+        print("  \033[91m[FAIL]\033[0m Teleop not available (need both T265 and Manus Glove)")
         all_pass = False
     
     # Sensors Summary

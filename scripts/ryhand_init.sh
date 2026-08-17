@@ -1,5 +1,8 @@
-sudo ip link set can0 down
+#!/usr/bin/env bash
+set -euo pipefail
 
-sudo ip link set can0 up type can bitrate 1000000
+interface="${1:-can0}"
 
-ip -details link show can0
+sudo ip link set "$interface" down 2>/dev/null || true
+sudo ip link set "$interface" up type can bitrate 1000000
+ip -details link show "$interface"

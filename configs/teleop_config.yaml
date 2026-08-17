@@ -1,27 +1,19 @@
-# Teleoperation and Control Configuration
-
 servo:
-  # servoL parameters (Cartesian space)
   speed: 0.5
   acceleration: 0.5
-  dt: 0.002
+  dt: 0.0125
   lookahead_time: 0.1
   gain: 300
-
-t265:
+vive:
   translation_scale: 1.0
-
 control:
-  update_rate: 80.0          # Hz
-  hand_motor_speed: 1000     # operating speed
-  hand_reset_speed: 500      # speed when resetting to zero
-
-velocity_profiler:
-  max_step: 0.15
-  min_step: 0.001        # deadband — T265 jitter below this is ignored (m)
-
-start_pose:
-  # UR5 joint angles (radians) for the initial / reset position
-  arm_joints: [-0.0575, -1.6630, -2.1179, -2.5305, -1.7108, 1.7728]
-  move_speed: 0.5            # moveJ speed (rad/s)
-  move_acceleration: 0.5     # moveJ acceleration (rad/s²)
+  update_rate: 80.0
+  input_timeout: 0.25
+  hand_motor_speed: 1000
+safety:
+  max_linear_speed: 0.2
+  max_angular_speed: 0.8
+  max_translation_from_reference: 0.3
+  max_rotation_from_reference: 1.0472
+  max_tracker_translation_jump: 0.05
+  max_tracker_rotation_jump: 0.35

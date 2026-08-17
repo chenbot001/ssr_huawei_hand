@@ -1,0 +1,1 @@
+"""Runtime robot model assets."""

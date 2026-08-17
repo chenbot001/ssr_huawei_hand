@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Huawei Teleop Console</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header>
+    <div class="brand"><span class="brand-logo" aria-hidden="true">H</span><span>Huawei Teleop Console</span></div>
+    <nav aria-label="Module navigation">
+      <button class="tab nav-tab active" data-tab="system" type="button">System</button>
+      <button class="tab nav-tab" data-tab="manus" type="button">Manus</button>
+      <button class="tab nav-tab" data-tab="ryhand" type="button">RYHand</button>
+      <button class="tab nav-tab" data-tab="teleop" type="button">Teleop</button>
+    </nav>
+    <button id="theme-toggle" class="theme-button" type="button" aria-pressed="false">Light</button>
+    <span id="global-state" class="state-pill">idle</span>
+  </header>
+
+  <main id="tab-system" class="tab-page active" aria-label="System">
+    <div class="left">
+      <section class="visual-panel system-visual">
+        <div class="panel-title">Hardware Inventory<span id="scan-time" class="panel-hint">Not checked</span></div>
+        <div id="hardware-inventory" class="hardware-inventory" aria-label="Hardware inventory"></div>
+        <div id="camera-strip" class="camera-strip empty">No RGB cameras configured</div>
+      </section>
+      <section class="log-section">
+        <div class="panel-title">System Terminal<button class="clear-log panel-action" type="button">Clear</button></div>
+        <div class="log terminal" data-terminal aria-live="polite">System console ready.</div>
+      </section>
+    </div>
+    <div class="right">
+      <section class="controls-panel">
+        <div class="panel-title">Controls</div>
+        <div class="panel-scroll">
+          <details class="ctl-group" name="system-controls" open>
+            <summary>UR Connection</summary>
+            <div class="ctl-body">
+              <div class="ctl-field"><label for="ur-ip">Robot IPv4 address</label><input id="ur-ip" type="text" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="192.168.0.2"></div>
+              <button id="ur-connect" class="primary" type="button">Connect UR</button>
+              <span class="ctl-note">Connection requires a working RTDE receive session, valid TCP pose, robot mode, and safety mode.</span>
+            </div>
+          </details>
+          <details class="ctl-group" name="system-controls" open>
+            <summary>RYHand CAN</summary>
+            <div class="ctl-body">
+              <button id="ryhand-init" class="primary" type="button">Run RYHand Init</button>
+              <span class="ctl-note">Executes scripts/ryhand_init.sh for the configured CAN interface. If needed, authorize first with sudo -v in a terminal.</span>
+            </div>
+          </details>
+          <details class="ctl-group" name="system-controls" open>
+            <summary>Hardware Status</summary>
+            <div class="ctl-body">
+              <button id="scan-system" class="primary" type="button">Refresh Status</button>
+              <span class="ctl-note">Read-only scan of endpoints, local libraries, CAN, SteamVR, and configured cameras.</span>
+            </div>
+          </details>
+          <details class="ctl-group" name="system-controls">
+            <summary>RGB Visual Input<span class="ctl-group-note">Optional</span></summary>
+            <div class="ctl-body">
+              <div class="ctl-field"><label for="camera-select">Configured camera</label><select id="camera-select"><option value="">No cameras configured</option></select></div>
+              <div class="ctl-actions"><button id="camera-start" type="button">Start Preview</button><button id="camera-stop" class="danger" type="button">Stop</button></div>
+              <div id="camera-preview-wrap" class="mini-preview empty"><span>Preview starts explicitly</span><img id="camera-preview" alt="RealSense RGB preview"></div>
+            </div>
+          </details>
+        </div>
+      </section>
+      <section class="status-section">
+        <div class="panel-title">System Health</div>
+        <div class="status-grid">
+          <div id="system-status-cards" class="dynamic-status-grid"></div>
+          <span class="status-footnote">This tab never sends motion commands or invokes sudo.</span>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <main id="tab-manus" class="tab-page manus-page" aria-label="Manus" hidden>
+    <div class="left">
+      <section class="visual-panel manus-preview">
+        <div class="panel-title">MANUS Hand Models<span id="manus-visual-state" class="panel-hint">Stopped</span></div>
+        <div class="manus-stage">
+          <canvas id="manus-canvas" aria-label="Live MANUS hand skeleton visualization"></canvas>
+          <div class="manus-panel-label left-label"><span class="manus-side-label">Left glove</span><span id="manus-left-battery-badge" class="manus-battery unknown"><span id="manus-left-battery">—</span></span></div>
+          <div class="manus-panel-label right-label"><span class="manus-side-label">Right glove</span><span id="manus-right-battery-badge" class="manus-battery unknown"><span id="manus-right-battery">—</span></span></div>
+          <div id="manus-offline" class="manus-offline">Start the shared MANUS stream to view hand models.</div>
+        </div>
+      </section>
+      <section class="log-section">
+        <div class="panel-title">Manus Terminal<button class="clear-log panel-action" type="button">Clear</button></div>
+        <div class="log terminal" data-terminal aria-live="polite">MANUS interface ready.</div>
+      </section>
+    </div>
+    <div class="right">
+      <section class="controls-panel">
+        <div class="panel-title">Controls</div>
+        <div class="panel-scroll">
+          <details class="ctl-group" name="manus-controls" open>
+            <summary>MANUS Session</summary>
+            <div class="ctl-body">
+              <span class="ctl-note">The console owns one MANUS Core 3.1.1 stream. This tab alone can change SDK settings and run official glove calibration; RYHand and Teleop consume its calibrated skeleton.</span>
+              <div class="ctl-actions"><button id="manus-start" class="primary" type="button">Start Stream</button><button id="manus-stop" class="danger" type="button">Stop</button></div>
+            </div>
+          </details>
+          <details class="ctl-group" name="manus-controls" open>
+            <summary>View</summary>
+            <div class="ctl-body">
+              <label class="slider-line manus-view-line"><span>Yaw</span><input id="manus-view-yaw" type="range" min="-180" max="180" value="90" step="1"><output id="manus-view-yaw-value">90°</output></label>
+              <label class="slider-line manus-view-line"><span>Pitch</span><input id="manus-view-pitch" type="range" min="-180" max="180" value="0" step="1"><output id="manus-view-pitch-value">0°</output></label>
+              <label class="slider-line manus-view-line"><span>Zoom</span><input id="manus-view-zoom" type="range" min="0.6" max="1.8" value="1" step="0.05"><output id="manus-view-zoom-value">1.00×</output></label>
+              <div class="ctl-row"><label for="manus-show-axes">Axes</label><input id="manus-show-axes" type="checkbox" checked></div>
+            </div>
+          </details>
+          <details class="ctl-group" name="manus-controls">
+            <summary>SDK Skeleton Settings</summary>
+            <div class="ctl-body">
+              <div class="ctl-field"><label for="manus-motion">Motion source</label><select id="manus-motion"><option value="4">Auto (tracker, IMU fallback)</option><option value="1">IMU orientation only</option><option value="2">Tracker position + orientation</option><option value="3">Tracker rotation only</option><option value="0">None</option></select></div>
+              <div class="ctl-row"><label for="manus-pinch">Pinch compensation</label><input id="manus-pinch" type="checkbox"></div>
+              <label class="slider-line manus-view-line"><span>Casing</span><input id="manus-casing" type="range" min="0" max="1" value="0" step="0.01"><output id="manus-casing-value">0.00</output></label>
+              <span id="manus-settings-note" class="ctl-note">Load settings from the active SDK session.</span>
+              <div class="ctl-actions"><button id="manus-settings-load" type="button">Refresh</button><button id="manus-settings-apply" class="primary" type="button">Apply</button></div>
+            </div>
+          </details>
+          <details class="ctl-group" name="manus-controls" open>
+            <summary>MANUS Calibration</summary>
+            <div class="ctl-body">
+              <div class="ctl-field"><label for="manus-calibration-hand">Glove</label><select id="manus-calibration-hand"><option value="left">Left</option><option value="right">Right</option></select></div>
+              <div class="ctl-row"><span class="ctl-note">Detected family</span><output id="manus-calibration-family">Waiting…</output></div>
+              <div class="manus-calibration-card"><b id="manus-calibration-title">Calibration idle</b><span id="manus-calibration-copy">Select a connected glove, then start the official MANUS calibration pipeline.</span><progress id="manus-calibration-progress" max="100" value="0"></progress></div>
+              <div class="ctl-actions"><button id="manus-calibration-start" class="primary" type="button">Start Calibration</button><button id="manus-calibration-next" type="button">Next Step</button></div>
+              <div class="ctl-actions"><button id="manus-calibration-save" class="primary" type="button">Save</button><button id="manus-calibration-cancel" class="danger" type="button">Cancel</button></div>
+            </div>
+          </details>
+        </div>
+      </section>
+      <section class="status-section">
+        <div class="panel-title">Runtime Status</div>
+        <div class="status-grid">
+          <div id="manus-status" class="dynamic-status-grid"></div>
+          <span class="status-footnote">The visual and calibration controls use the migrated EgoTac MANUS Core 3.1.1 integration.</span>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <main id="tab-ryhand" class="tab-page" aria-label="RYHand" hidden>
+    <div class="left">
+      <section class="visual-panel calibration-visual">
+        <div class="panel-title">PyBullet Hand Model<span id="calibration-visual-state" class="panel-hint">Stopped</span></div>
+        <div class="calibration-stage">
+          <img id="calibration-frame" alt="PyBullet rendering of the RYHand model">
+          <div id="calibration-placeholder" class="stage-placeholder"><span class="large-icon">⌁</span><b>Simulation offline</b><small>Start calibration to stream the PyBullet model.</small></div>
+        </div>
+        <div id="calibration-angle-bars" class="angle-bars"></div>
+      </section>
+      <section class="log-section">
+        <div class="panel-title">RYHand Terminal<button class="clear-log panel-action" type="button">Clear</button></div>
+        <div class="log terminal" data-terminal aria-live="polite">RYHand calibration interface ready.</div>
+      </section>
+    </div>
+    <div class="right">
+      <section class="controls-panel">
+        <div class="panel-title">Controls</div>
+        <div class="panel-scroll">
+          <details class="ctl-group" name="calibration-controls" open>
+            <summary>Calibration Session<span class="ctl-group-note">Simulation default</span></summary>
+            <div class="ctl-body">
+              <div class="ctl-field"><label for="calibration-side">Glove side</label><select id="calibration-side"><option value="left">Left</option><option value="right">Right</option></select></div>
+              <div class="ctl-row"><label for="calibration-live">Command physical RYHand</label><input id="calibration-live" type="checkbox"></div>
+              <span class="ctl-note">Live output requires CAN and holds the last pose on stop.</span>
+              <div class="ctl-actions"><button id="calibration-start" class="primary" type="button">Start</button><button id="calibration-stop" class="danger" type="button">Stop</button></div>
+            </div>
+          </details>
+          <details class="ctl-group" name="calibration-controls" open>
+            <summary>Thumb + Index Mapping</summary>
+            <div class="ctl-body calibration-mapping-body">
+              <div id="calibration-sliders"></div>
+              <div class="ctl-actions"><button id="calibration-apply" type="button">Apply</button><button id="calibration-save" class="primary" type="button">Save</button></div>
+            </div>
+          </details>
+        </div>
+      </section>
+      <section class="status-section">
+        <div class="panel-title">Status</div>
+        <div class="status-grid">
+          <div id="calibration-status" class="dynamic-status-grid"></div>
+          <span class="status-footnote">Only thumb/index parameters are editable. Middle, ring, and pinky outputs remain zero.</span>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <main id="tab-teleop" class="tab-page" aria-label="Teleop" hidden>
+    <div class="left">
+      <section class="visual-panel teleop-visual">
+        <div class="panel-title">Computed UR Delta<span id="teleop-visual-state" class="panel-hint">Stopped</span></div>
+        <div class="delta-stage">
+          <div class="delta-header"><span id="visual-mode">No session</span><b id="visual-clutch">CLUTCH ENGAGED</b></div>
+          <div class="delta-grid" role="status" aria-label="Live computed UR motion delta">
+            <article class="delta-card"><span>ΔX</span><b id="teleop-delta-x">0.00</b><small>mm</small></article>
+            <article class="delta-card"><span>ΔY</span><b id="teleop-delta-y">0.00</b><small>mm</small></article>
+            <article class="delta-card"><span>ΔZ</span><b id="teleop-delta-z">0.00</b><small>mm</small></article>
+            <article class="delta-card rotation"><span>ΔRX</span><b id="teleop-delta-rx">0.00</b><small>deg</small></article>
+            <article class="delta-card rotation"><span>ΔRY</span><b id="teleop-delta-ry">0.00</b><small>deg</small></article>
+            <article class="delta-card rotation"><span>ΔRZ</span><b id="teleop-delta-rz">0.00</b><small>deg</small></article>
+          </div>
+          <p class="delta-reference">UR base frame · relative to the TCP pose captured at clutch release</p>
+        </div>
+        <div class="telemetry-strip"><div><small>Vive age</small><b id="vive-age">—</b></div><div><small>Manus age</small><b id="manus-age">—</b></div></div>
+      </section>
+      <section class="log-section">
+        <div class="panel-title">Teleop Terminal<button class="clear-log panel-action" type="button">Clear</button></div>
+        <div class="log terminal" data-terminal aria-live="polite">Teleoperation interface ready.</div>
+      </section>
+    </div>
+    <div class="right">
+      <section class="controls-panel">
+        <div class="panel-title">Controls</div>
+        <div class="panel-scroll">
+          <details class="ctl-group" name="teleop-controls" open>
+            <summary>Teleoperation Mode</summary>
+            <div class="ctl-body">
+              <div class="ctl-field"><label for="teleop-mode">Mode</label><select id="teleop-mode"></select></div>
+              <span id="teleop-mode-description" class="ctl-note"></span>
+              <div id="teleop-config-fields" class="compact-config"></div>
+              <button id="teleop-config-save" type="button">Save Configuration</button>
+              <span class="ctl-note">Saved values are written atomically to the hardware and teleoperation YAML files and apply to the next session.</span>
+            </div>
+          </details>
+          <details class="ctl-group" name="teleop-controls" open>
+            <summary>Input and Clutch</summary>
+            <div class="ctl-body">
+              <div class="ctl-field"><label for="teleop-vive-side">Vive tracker</label><select id="teleop-vive-side"><option value="left">Left tracker</option><option value="right">Right tracker</option></select></div>
+              <div class="ctl-field"><label for="teleop-manus-side">MANUS glove</label><select id="teleop-manus-side"><option value="left">Left glove</option><option value="right">Right glove</option></select></div>
+              <span class="ctl-note">Vive and MANUS are independent inputs. The tracker drives only the UR; the glove drives only the RYHand.</span>
+              <div class="clutch-note"><span class="keycap">SPACE</span><span class="ctl-note">Release captures new tracker/TCP references and enables relative UR motion. MANUS controls RYHand independently.</span></div>
+              <div class="ctl-actions"><button id="teleop-start" class="primary" type="button">Start Mode</button><button id="teleop-toggle" type="button">Release clutch</button></div>
+              <button id="teleop-stop" class="danger" type="button">Stop and Hold</button>
+            </div>
+          </details>
+        </div>
+      </section>
+      <section class="status-section">
+        <div class="panel-title">Status</div>
+        <div class="status-grid">
+          <div id="teleop-status" class="dynamic-status-grid"></div>
+          <span class="status-footnote">The live delta is zero whenever the clutch is engaged and the UR is held. Stale Vive input engages the clutch; stale MANUS input holds only the RYHand.</span>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

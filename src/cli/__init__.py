@@ -1,0 +1,1 @@
+"""Installed command entry points."""

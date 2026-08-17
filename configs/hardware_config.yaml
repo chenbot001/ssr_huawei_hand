@@ -1,26 +1,12 @@
 ur_arm:
   ip: 192.168.3.4
+vive_tracker:
+  left_serial: LHR-D78D8ACE
+  right_serial: LHR-76281224
 manus_glove:
-  address: tcp://localhost:8000
-  left_sn: 4848debd
-  right_sn: db397317
+  address: udp://127.0.0.1:9001
+  left_id: 0
+  right_id: 0
 ruiyan_hand:
   port: can0
-  init_script: external/RuiyanHand_for_linux/ryhand_init.sh
-cameras:
-  fingertips:
-    thumb:
-      id: usb-0000:00:14.0-5.1.2
-      offset: 0
-    index:
-      id: usb-0000:00:14.0-5.1.3
-      offset: 0
-  realsense:
-  - name: rs_env
-    id: usb-0000:00:14.0-4
-    offset: 4
-    zoom: 1.0
-  - name: rs_wrist
-    id: usb-0000:00:14.0-5.2
-    offset: 4
-    zoom: 1.0
+rgb_cameras: []

@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ssr-teleop"
+version = "0.2.0"
+description = "UR5 and RYHand teleoperation with Vive and Manus inputs"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "PyYAML",
+    "scipy",
+    "ur-rtde",
+    "python-can",
+    "pybullet",
+    "openvr>=2.12.1401",
+    "pynput",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+rgb = ["pyrealsense2"]
+
+[project.scripts]
+ssr-teleop = "cli.teleop:main"
+ssr-check = "cli.check:main"
+ssr-calibrate-hand = "cli.calibrate:main"
+ssr-console = "console.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["config"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["assets*", "cli*", "console*", "control*", "hardware*"]
+
+[tool.setuptools.package-data]
+assets = [
+    "ruihand15z/package.xml",
+    "ruihand15z/urdf/*.urdf",
+    "ruihand15z/meshes/*.STL",
+]
+hardware = ["lib/README.md"]
+"hardware.manus_sdk" = ["MANUS_SDK_LICENSE.txt", "README.md"]
+console = ["web/*.html", "web/*.css", "web/*.js"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

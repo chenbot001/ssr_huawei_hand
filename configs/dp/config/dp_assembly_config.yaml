@@ -1,0 +1,23 @@
+# @package _global_
+defaults:
+  - /workspace/train_diffusion_unet_ssr_assembly_workspace
+  - _self_
+
+task:
+  dataset:
+    dataset_path: data/assembly/ryhand_assembly_dataset.zarr
+
+training:
+  device: "cuda:0"
+
+# Deployment (scripts/deploy_policy.py) — one-click: python scripts/deploy_policy.py
+# Override: python scripts/deploy_policy.py deployment.checkpoint_path=/abs/path/to/best.ckpt
+deployment:
+  #checkpoint_path: data/assembly/outputs/2026.04.29/22.27.28_train_diffusion_unet_hybrid_assembly_ssr_assembly_image/checkpoints/latest.ckpt
+  checkpoint_path: data/assembly/outputs/2026.04.29/22.27.28_train_diffusion_unet_hybrid_assembly_ssr_assembly_image/checkpoints/latest.ckpt
+  device: ${training.device}
+  frequency: 15.0
+  steps_per_inference: 4
+  max_duration: 120.0
+  dry_run: false
+  no_start_pose: false

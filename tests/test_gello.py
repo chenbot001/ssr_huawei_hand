@@ -6,7 +6,7 @@ import numpy as np
 
 # Setup paths
 current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(os.path.dirname(current_dir))
+project_root = os.path.dirname(current_dir)
 external_gello = os.path.join(project_root, "external", "gello_software")
 src_path = os.path.join(project_root, "src")
 

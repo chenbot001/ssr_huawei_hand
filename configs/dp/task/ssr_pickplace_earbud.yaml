@@ -1,0 +1,37 @@
+name: ssr_pickplace_earbud_image
+
+image_shape: &image_shape [3, 240, 320]
+
+shape_meta: &shape_meta
+  obs:
+    camera_env:
+      shape: *image_shape
+      type: rgb
+    camera_wrist:
+      shape: *image_shape
+      type: rgb
+    arm_eef_pose:
+      shape: [6]
+      type: low_dim
+    hand_joint_angles:
+      shape: [15]   # 只记录大拇指侧摆+弯曲和食指弯曲相关关节角
+      type: low_dim
+  action:
+    shape: [21]    # 机械臂+灵巧手相关自由度（请根据实际控制量调整）
+
+env_runner:
+  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+
+dataset:
+  _target_: ssr.dataset.ssr_pickplace_image_dataset.SSRPickPlaceImageDataset
+  shape_meta: *shape_meta
+  dataset_path: data/pickplace_earbud/place/ryhand_place_earbud_.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  n_obs_steps: ${dataset_obs_steps}
+  n_latency_steps: ${n_latency_steps}
+  seed: 42
+  val_ratio: 0.1
+  max_train_episodes: null
+  load_into_memory: True

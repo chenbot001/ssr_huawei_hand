@@ -13,7 +13,7 @@ Edge cases handled:
   - Cameras that fail to produce frames are skipped
 
 Usage:
-    python scripts/sys_test/assign_cam.py
+    python scripts/assign_cam.py
 """
 
 import sys
@@ -25,6 +25,14 @@ import subprocess
 import cv2
 import numpy as np
 import yaml
+
+try:
+    import pyrealsense2 as rs
+
+    _HAS_RS = True
+except ImportError:
+    rs = None
+    _HAS_RS = False
 
 # ============================================================================
 # Path setup
@@ -49,6 +57,99 @@ CANVAS_W, CANVAS_H = 960, 640
 # Pixel‐format families — used to distinguish colour nodes from depth / IR
 COLOR_FORMATS = {"YUYV", "MJPG", "RGB3", "BGR3", "NV12", "NV21", "UYVY", "RGBP", "BA24"}
 DEPTH_IR_FORMATS = {"Z16", "Y16", "Y8", "GREY", "PAIR", "Y12I", "Y8I", "INZI", "INVI"}
+# RealSense RGB 在 Linux V4L2 上多为 MJPG / YUYV；其它节点可能声明彩色格式但 read() 会长时间阻塞
+REALSENSE_RGB_HINT = {"MJPG", "YUYV", "UYVY"}
+
+# OpenCV 4.5+：缩短无响应节点的阻塞时间（否则每个坏节点可能卡 ~10s）
+_CAP_OPEN_TO = getattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC", 53)
+_CAP_READ_TO = getattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC", 54)
+_V4L_READ_TIMEOUT_MS = 2000
+
+
+def _usb_paths_match(usb_id, physical_port):
+    """Match v4l2 stable id (e.g. usb-0000:00:14.0-12) to librealsense physical_port."""
+    if not usb_id or not physical_port:
+        return False
+    u = usb_id.strip()
+    p = physical_port.strip()
+    return u in p or p in u
+
+
+def _rs_device_is_t265(dev):
+    try:
+        name = dev.get_info(rs.camera_info.name).lower()
+    except Exception:
+        return False
+    return "t265" in name or "tracking" in name
+
+
+def _find_rs_device_by_usb(usb_id):
+    """Return pyrealsense2.device for this USB path, or None."""
+    if not _HAS_RS:
+        return None
+    for dev in rs.context().query_devices():
+        if _rs_device_is_t265(dev):
+            continue
+        try:
+            pp = dev.get_info(rs.camera_info.physical_port)
+        except Exception:
+            continue
+        if _usb_paths_match(usb_id, pp):
+            return dev
+    return None
+
+
+def _build_rs_color_pipeline(serial_number):
+    """Start a color-only pipeline; same resolution fallback as RealSenseWorker."""
+    try_list = [(640, 480), (424, 240), (1280, 720)]
+    for sw, sh in try_list:
+        for fps in (30, 15, 6):
+            cfg = rs.config()
+            cfg.enable_device(serial_number)
+            cfg.enable_stream(rs.stream.color, sw, sh, rs.format.bgr8, fps)
+            p = rs.pipeline()
+            try:
+                p.start(cfg)
+                return p
+            except RuntimeError:
+                try:
+                    p.stop()
+                except Exception:
+                    pass
+    return None
+
+
+def _grab_one_color_frame_rs(serial_number):
+    """Verify the device can stream color via SDK (avoids flaky V4L2-only opens)."""
+    if not _HAS_RS:
+        return None
+    p = _build_rs_color_pipeline(serial_number)
+    if p is None:
+        return None
+    try:
+        frames = p.wait_for_frames(timeout_ms=5000)
+        cf = frames.get_color_frame()
+        if not cf:
+            return None
+        return np.asanyarray(cf.get_data())
+    except RuntimeError:
+        return None
+    finally:
+        try:
+            p.stop()
+        except Exception:
+            pass
+
+
+def _read_frame_from_rs_pipeline(pipeline):
+    try:
+        frames = pipeline.wait_for_frames(timeout_ms=5000)
+        cf = frames.get_color_frame()
+        if not cf:
+            return None
+        return np.asanyarray(cf.get_data())
+    except RuntimeError:
+        return None
 
 
 # ============================================================================
@@ -128,12 +229,17 @@ def _node_index(node_path):
     return int(m.group(1)) if m else None
 
 
-def _try_read_frame(video_index, timeout_frames=15):
+def _try_read_frame(video_index, timeout_frames=8):
     """Open a V4L2 node, try to grab a BGR frame. Returns frame or None."""
     cap = cv2.VideoCapture(video_index, cv2.CAP_V4L2)
     if not cap.isOpened():
         cap.release()
         return None
+    try:
+        cap.set(_CAP_OPEN_TO, _V4L_READ_TIMEOUT_MS)
+        cap.set(_CAP_READ_TO, _V4L_READ_TIMEOUT_MS)
+    except Exception:
+        pass
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     frame = None
     for _ in range(timeout_frames):
@@ -141,7 +247,7 @@ def _try_read_frame(video_index, timeout_frames=15):
         if ret and f is not None and len(f.shape) == 3 and f.shape[2] == 3:
             frame = f
             break
-        time.sleep(0.05)
+        time.sleep(0.02)
     cap.release()
     return frame
 
@@ -158,6 +264,9 @@ def discover_rgb_cameras():
     Returns a list of camera‐info dicts.
     """
     print("[发现] 正在枚举 V4L2 视频设备...")
+    if _HAS_RS:
+        print("[发现] pyrealsense2 已加载：Intel RealSense 将优先通过 SDK 取流"
+              "（缓解仅枚举到设备但 V4L2 读帧超时的情况）")
     devices = parse_v4l2_devices()
 
     if not devices:
@@ -176,8 +285,31 @@ def discover_rgb_cameras():
 
         print(f"  [探测] {dev['name']} ...", end=" ", flush=True)
 
-        # Walk through nodes, find one whose advertised formats are colour‐only
-        found = False
+        is_intel_rs = "intel" in dev["name"].lower()
+
+        # --- Prefer librealsense2 color stream (stable when V4L2 enumerate works but read() stalls) ---
+        if is_intel_rs and _HAS_RS:
+            rs_dev = _find_rs_device_by_usb(dev["usb_id"])
+            if rs_dev is not None:
+                try:
+                    serial = rs_dev.get_info(rs.camera_info.serial_number)
+                except Exception:
+                    serial = ""
+                if serial and _grab_one_color_frame_rs(serial) is not None:
+                    cameras.append({
+                        "name": dev["name"],
+                        "usb_id": dev["usb_id"],
+                        "serial_number": serial,
+                        "backend": "rs",
+                        "video_index": 0,
+                        "node": f"pyrealsense2:{serial[:8]}…",
+                        "offset": 0,
+                        "all_nodes": dev["nodes"],
+                    })
+                    print(f"RGB 可用 (pyrealsense2 serial={serial}, SDK)")
+                    continue
+
+        candidates = []
         for offset, node in enumerate(dev["nodes"]):
             fmts = _node_pixel_formats(node)
             stripped = {f.strip() for f in fmts}
@@ -188,18 +320,31 @@ def discover_rgb_cameras():
             if not has_color or has_depth_ir:
                 continue  # depth / IR / metadata node — skip
 
+            # RealSense：只考虑典型 RGB 流格式，避免对 metadata/辅助节点 read() 长时间阻塞
+            if is_intel_rs and not (stripped & REALSENSE_RGB_HINT):
+                continue
+
             vid_idx = _node_index(node)
             if vid_idx is None:
                 continue
 
-            # Final verification: can we actually read a colour frame?
-            frame = _try_read_frame(vid_idx, timeout_frames=15)
+            has_mjpg = 1 if "MJPG" in stripped else 0
+            # 优先 MJPG，其次较低 video 编号（通常 RGB 在 depth/IR 之后的前几个 colour 节点）
+            candidates.append((has_mjpg, -vid_idx, offset, node, stripped))
+
+        candidates.sort(reverse=True)
+
+        found = False
+        for _hm, _neg_idx, offset, node, stripped in candidates:
+            vid_idx = _node_index(node)
+            frame = _try_read_frame(vid_idx, timeout_frames=8)
             if frame is None:
                 continue
 
             cameras.append({
                 "name": dev["name"],
                 "usb_id": dev["usb_id"],
+                "backend": "opencv",
                 "video_index": vid_idx,
                 "node": node,
                 "offset": offset,
@@ -265,12 +410,30 @@ def run_binding_ui(cameras):
 
     bindings = {}      # role -> camera list‐index
     cur = [0]          # current camera index (mutable for inner funcs)
-    cap = [None]       # current VideoCapture
+    cap = [None]       # current OpenCV VideoCapture (V4L2 backend)
+    rs_pipe = [None]   # current pyrealsense2 pipeline (SDK backend)
 
-    def open_cam(idx):
+    def release_cam():
         if cap[0] is not None:
             cap[0].release()
-        c = cv2.VideoCapture(cameras[idx]["video_index"], cv2.CAP_V4L2)
+            cap[0] = None
+        if rs_pipe[0] is not None:
+            try:
+                rs_pipe[0].stop()
+            except Exception:
+                pass
+            rs_pipe[0] = None
+
+    def open_cam(idx):
+        release_cam()
+        cam = cameras[idx]
+        if cam.get("backend") == "rs" and _HAS_RS:
+            pl = _build_rs_color_pipeline(cam["serial_number"])
+            if pl is None:
+                print(f"[警告] SDK 无法启动预览 (serial={cam.get('serial_number')})")
+            rs_pipe[0] = pl
+            return
+        c = cv2.VideoCapture(cam["video_index"], cv2.CAP_V4L2)
         c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         c.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         c.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -296,7 +459,10 @@ def run_binding_ui(cameras):
 
         # --- Read frame ---
         frame = None
-        if cap[0] is not None and cap[0].isOpened():
+        if cam.get("backend") == "rs":
+            if rs_pipe[0] is not None:
+                frame = _read_frame_from_rs_pipeline(rs_pipe[0])
+        elif cap[0] is not None and cap[0].isOpened():
             ret, frame = cap[0].read()
             if not ret:
                 frame = None
@@ -310,10 +476,12 @@ def run_binding_ui(cameras):
         cv2.putText(canvas,
                     f"Camera {cur[0] + 1}/{len(cameras)}: {cam['name']}",
                     (12, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-        cv2.putText(canvas,
-                    f"USB: {cam['usb_id']}  |  Node: {cam['node']}  |  "
-                    f"video{cam['video_index']}",
-                    (12, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (170, 170, 170), 1)
+        if cam.get("backend") == "rs":
+            sub = f"USB: {cam['usb_id']}  |  pyrealsense2  serial={cam.get('serial_number', '')}"
+        else:
+            sub = (f"USB: {cam['usb_id']}  |  Node: {cam['node']}  |  "
+                   f"video{cam['video_index']}")
+        cv2.putText(canvas, sub, (12, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (170, 170, 170), 1)
 
         # Which role (if any) is this camera assigned to?
         this_role = None
@@ -419,8 +587,7 @@ def run_binding_ui(cameras):
         elif click == "Save & Exit" and all_assigned:
             break
 
-    if cap[0] is not None:
-        cap[0].release()
+    release_cam()
     cv2.destroyAllWindows()
 
     return {role: cameras[idx] for role, idx in bindings.items()}
@@ -443,12 +610,16 @@ def save_bindings(bindings):
     for role in ("env", "wrist"):
         if role in bindings:
             cam = bindings[role]
-            rs_list.append({
+            entry = {
                 "name": f"rs_{role}",
                 "id": cam["usb_id"],
-                "offset": cam["offset"],
+                "offset": cam.get("offset", 0),
                 "zoom": 1.0,
-            })
+            }
+            sn = (cam.get("serial_number") or "").strip()
+            if cam.get("backend") == "rs" and sn:
+                entry["serial"] = sn
+            rs_list.append(entry)
 
     config.setdefault("cameras", {})["realsense"] = rs_list
 
@@ -458,8 +629,10 @@ def save_bindings(bindings):
 
     print(f"\n[保存] 相机绑定已写入: {config_path}")
     for role, cam in bindings.items():
-        print(f"  rs_{role}: id={cam['usb_id']}, offset={cam['offset']}, "
-              f"node={cam['node']}")
+        line = f"  rs_{role}: id={cam['usb_id']}, offset={cam.get('offset', 0)}"
+        if cam.get("serial_number"):
+            line += f", serial={cam['serial_number']}"
+        print(line)
 
 
 # ============================================================================

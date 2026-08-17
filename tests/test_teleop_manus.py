@@ -17,11 +17,9 @@ os.chdir(project_root)
 
 import time
 import math
-import json
 import threading
 import numpy as np
 import pyrealsense2 as rs
-import pybullet as p
 import zmq
 from pynput import keyboard
 from scipy.spatial.transform import Rotation as R
@@ -29,6 +27,7 @@ from scipy.spatial.transform import Rotation as R
 from ssr.hardware.arm_ur5 import UR5Arm
 from ssr.hardware.ruiyan_driver import RyHandController
 from ssr.config import get_hardware_config, get_teleop_config
+from ssr.control.RyHand_IK import RYHandIK, ik_to_hand_angles
 
 # ============================================================================
 # 手套和手部配置 (从 configs/hardware_config.yaml 加载)
@@ -42,22 +41,6 @@ RIGHT_GLOVE_SN = _manus_config.get('right_sn', "db397317")
 NUM_JOINTS = 25
 VALUES_PER_JOINT = 7
 SHORT_IDX = [23, 24, 4, 5, 9, 10, 19, 20, 14, 15]
-
-CALIBRATION_FILE = os.path.join(project_root, "configs", "manus_calibration.json")
-FINGER_SCALES = [1.0, 1.0, 1.0, 1.0, 1.0]
-WRIST_OFFSET = [0.0, 0.0, 0.0]
-FINGER_POS_OFFSETS = [[0.0, 0.0, 0.0] for _ in range(5)]
-
-if os.path.exists(CALIBRATION_FILE):
-    try:
-        with open(CALIBRATION_FILE, 'r') as f:
-            calib = json.load(f)
-            FINGER_SCALES = calib.get("FINGER_SCALES", FINGER_SCALES)
-            WRIST_OFFSET = calib.get("WRIST_OFFSET", WRIST_OFFSET)
-            FINGER_POS_OFFSETS = calib.get("FINGER_POS_OFFSETS", FINGER_POS_OFFSETS)
-            print(f"[初始化] 成功加载校准文件: {CALIBRATION_FILE}")
-    except Exception as e:
-        print(f"[初始化] 加载校准文件失败: {e}")
 
 # ============================================================================
 # 机械臂和T265配置 (从 configs/teleop_config.yaml 加载)
@@ -202,158 +185,8 @@ class GloveDataReceiver:
         self.socket.close()
         self.context.term()
 
-class RYHandIK:
-    def __init__(self):
-        self.physics_client = p.connect(p.DIRECT)  # 使用无头模式提高性能
-        p.setGravity(0, 0, 0)
-        p.setRealTimeSimulation(0)
-        
-        urdf_path = os.path.join(project_root, "external", "Bidex_Manus_Teleop", "ryhand_left", "ruihand15z.urdf")
-        self.robot_id = p.loadURDF(urdf_path, [0, 0, 0], p.getQuaternionFromEuler([0, 0, np.pi/2]), useFixedBase=True)
-        
-        self.actuated_joints = []
-        self.link_name_to_idx = {}
-        for i in range(p.getNumJoints(self.robot_id)):
-            info = p.getJointInfo(self.robot_id, i)
-            self.link_name_to_idx[info[12].decode('utf-8')] = i
-            if info[2] == p.JOINT_REVOLUTE:
-                self.actuated_joints.append(i)
-        
-        fingertip_links = ["fz15_Link", "fz25_Link", "fz35_Link", "fz45_Link", "fz55_Link"]
-        self.ee_indices = [self.link_name_to_idx[name] for name in fingertip_links if name in self.link_name_to_idx]
-        
-        # 预设输出状态池(存储20个主动关节坐标集)
-        self.joint_positions = np.zeros(20)
-    
-    def compute_ik(self, glove_data):
-        if glove_data is None or 'fingers' not in glove_data:
-            return None
-        
-        short_skeleton = glove_data['fingers']
-        
-        if short_skeleton is None or len(short_skeleton) < 10:
-            return None
-        
-        hand_pos = []
-        for i, pos in enumerate(short_skeleton):
-            finger_idx = i // 2
-            offset = FINGER_POS_OFFSETS[finger_idx]
-            hand_pos.append([pos[0] + offset[0], pos[1] + offset[1], pos[2] + offset[2]])
-        
-        tip_indices = [1, 3, 5, 7, 9]
-        fingertip_positions = []
-        for i, tip_idx in enumerate(tip_indices):
-            pos = hand_pos[tip_idx]
-            scale = FINGER_SCALES[i]
-            fingertip_positions.append([pos[0]*scale, pos[1]*scale, pos[2]*scale])
-        
-        num_ee = min(len(fingertip_positions), len(self.ee_indices))
-        
-        p.stepSimulation()
-        
-        try:
-            joint_poses = p.calculateInverseKinematics2(
-                self.robot_id,
-                self.ee_indices[:num_ee],
-                fingertip_positions[:num_ee],
-                solver=p.IK_DLS,
-                maxNumIterations=100,
-                residualThreshold=0.001,
-            )
-            
-            # 推送解析完的姿态使虚拟手跟随变形以提供视觉验证（影响后续IK计算的初始状态）
-            for i, joint_idx in enumerate(self.actuated_joints):
-                if i < len(joint_poses):
-                    p.setJointMotorControl2(
-                        bodyIndex=self.robot_id,
-                        jointIndex=joint_idx,
-                        controlMode=p.POSITION_CONTROL,
-                        targetPosition=joint_poses[i],
-                        targetVelocity=0,
-                        force=500,
-                        positionGain=0.3,
-                        velocityGain=1,
-                    )
-            
-            # 返回提取好的角度结构池缓存以供真机转发使用
-            self.joint_positions = np.array(joint_poses[:20], dtype=np.float32)
-            return self.joint_positions
-            
-        except Exception as e:
-            print(f"[IK计算错误] {e}")
-            return None
 
-def ik_to_hand_angles(ik_joints):
-    """
-    负责将IK模拟解算的高维姿态(20关节) 降维转译到 Ruihand 真机的物理闭环控制器参数(15自由度指令)。
-    
-    仿真URDF文件映射架构(每手指4个旋转自由度,累计20指节):
-        每根手指内部顺序为: fzX1 (左右开合指根), fzX2 (MCP主弯折), fzX3(PIP指中弯折), fzX4(DIP指尖弯折)
-        - fzX1 开合物理结构限位: [-0.524, 0.524] 弧度 = [-30°, 30°]
-        - fzX2~X4 前屈物理限位: [0, 1.57] 弧度 = [0°, 90°]
-        
-    对应提取出 IK 数据张量池 结构索引：
-        拇指:  [0]=fz11, [1]=fz12, [2]=fz13, [3]=fz14
-        食指:  [4]=fz21, [5]=fz22, [6]=fz23, [7]=fz24
-        中指:  [8]=fz31, [9]=fz32, [10]=fz33, [11]=fz34
-        无名指:[12]=fz41, [13]=fz42, [14]=fz43, [15]=fz44
-        小指:  [16]=fz51, [17]=fz52, [18]=fz53, [19]=fz54
-    
-    真实五指机械手硬件设计架构(每根手指3个物理电机,累计15电机通道):
-        每根手指映射格式: [左右开合(side_swing), 近端弯折MCP(proximal_bend), 远端联动弯折(distal_bend)]
-        - 开合(side_swing): 取值 [-30°, 30°]
-        - 近端MCP(proximal_bend): 取值 [0°, 90°]
-        - 末端(distal_bend): 取值 [0°, 75°]
-    
-    转换映射法则:
-        - fzX1 -> 直接直通赋予 侧向开合驱动电机
-        - fzX2 -> 直接直通赋予 根部近端电机 (最主要的握持发力关节)
-        - (fzX3 + fzX4) -> 拟合糅合成单一参数赋予 远端联动电机
-          在真实灵巧手中，PIP和DIP(指中指尖)是通过一个单一拉钩马达连杆驱动并做耦合运动的，
-          所以必须对IK的独立双角度进行平均与限位衰减再下发。
-    
-    参数:
-        ik_joints: [numpy 数组] 保存IK解算后的20维纯物理弧度张量
-        
-    返回:
-        [numpy 数组] 含有15位降阶电机命令弧度目标列表，供驱动板使用
-    """
-    hand_angles = np.zeros(15, dtype=np.float64)
-    
-    # 物理软硬件夹角边界值限位 (转换成弧度)
-    limit_side = np.deg2rad(30)    # 极限阈值 +/- 30度
-    limit_prox = np.deg2rad(90)    # 极限阈值 0~90度弯曲
-    limit_dist = np.deg2rad(75)    # 极限阈值 0~75度联动弯曲
-    
-    for finger in range(5):
-        ik_base = finger * 4  # 按单指4关节计算偏移基址
-        hand_base = finger * 3  # 按电机板单指3通道寻找写入基址
-        
-        # 1. 左右侧边摆动开合 (fzX1) - 仅冻结非大拇指的侧摆自由度
-        side_swing = ik_joints[ik_base]
-        if finger == 0:
-            # 大拇指保持侧摆自由度
-            hand_angles[hand_base] = np.clip(side_swing, -limit_side, limit_side)
-        else:
-            # 其他手指冻结侧摆自由度
-            hand_angles[hand_base] = 0.0
-        
-        # 2. MCP根部基础弯折 (fzX2) - 主力对一对一直通
-        proximal = ik_joints[ik_base + 1]
-        hand_angles[hand_base + 1] = np.clip(proximal, 0, limit_prox)
-        
-        # 3. 远端联动拉绳合并 - 处理仿真IK的双关节(fzX3 PIP 与 fzX4 DIP)
-        pip_angle = ik_joints[ik_base + 2] 
-        dip_angle = ik_joints[ik_base + 3] 
-        
-        # 将双关节参数等强降维取均值，并以比例系数[75/90]缩放到适配最大75度的真实电机限幅区间内
-        combined_distal = (pip_angle + dip_angle) * 0.5
-        scaled_distal = combined_distal * (75.0 / 90.0)
-
-        # 保护性截断超量程指令避免电机烧毁
-        hand_angles[hand_base + 2] = np.clip(scaled_distal, 0, limit_dist)
-    
-    return hand_angles
+# RYHandIK and ik_to_hand_angles are imported from ssr.control.RyHand_IK (see top)
 
 # ============================================================================
 # 主控逻辑 (Main Application)

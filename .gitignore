@@ -1,13 +1,20 @@
-# Python
+# ===== 数据集和输出（体积巨大，不上传）=====
+data/
+outputs/
+*.zarr/
+*.zarr.zip
+
+# ===== 第三方代码归档 =====
+external/*.tar.xz
+external/*.tar.gz
+external/*.zip
+
+# ===== Python =====
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
 .Python
-env/
-venv/
-.env
-.venv/
 build/
 develop-eggs/
 dist/
@@ -23,14 +30,65 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+MANIFEST
 
-# VS Code
-.vscode/
+# ===== 虚拟环境 =====
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
 
-# Project specific
-demo/
-data/
+# ===== Jupyter =====
+.ipynb_checkpoints
+*.ipynb_checkpoints/
 
-# OS
+# ===== IDE =====
+.idea/
+*.swp
+*.swo
+*~
 .DS_Store
-Thumbs.db
+
+# ===== 训练/日志/检查点 =====
+*.ckpt
+*.pth
+*.pt
+*.h5
+*.weights
+wandb/
+runs/
+logs/
+*.log
+tensorboard/
+lightning_logs/
+
+# ===== 大型媒体文件 =====
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.bag
+
+# ===== 大型图像批量数据 =====
+# 单张图片可以保留，但批量数据目录通常较大
+# 如需保留示例图，请显式 git add
+
+# ===== 临时文件 =====
+*.tmp
+*.bak
+*.cache
+.cache/
+
+# ===== 模型权重 =====
+*.bin
+*.safetensors
+*.onnx
+
+# ===== 大于 100MB 的常见格式 =====
+*.npy
+*.npz
+*.pkl
+*.pickle

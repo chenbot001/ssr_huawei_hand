@@ -8,7 +8,7 @@ MANUS数据手套到Ruiyan(RY)左手真机遥操作脚本
 使用方法:
     1. 启动MANUS SDK客户端
     2. 将RYHand连接至CAN总线
-    3. 运行此脚本: python teleop_ryhand.py
+    3. 运行此脚本: python tests/test_ryhand_teleop.py
 
 依赖环境:
     pip install pyzmq numpy pybullet python-can
@@ -19,10 +19,8 @@ import os
 import sys
 import time
 import math
-import json
 import threading
 import numpy as np
-import pybullet as p
 import zmq
 
 # 路径设置
@@ -42,6 +40,7 @@ os.chdir(project_root)
 try:
     from ssr.hardware.ruiyan_driver import RyHandController
     from ssr.config import get_hardware_config, get_teleop_config
+    from ssr.control.RyHand_IK import RYHandIK, ik_to_hand_angles
 except ImportError as e:
     print(f"导入错误: {e}")
     print("请确保已安装ssr包。")
@@ -187,33 +186,9 @@ VALUES_PER_JOINT = 7  # 坐标+四元数: x, y, z, qx, qy, qz, qw
 # 顺序: 拇指_DIP, 拇指_Tip, 食指_DIP, 食指_Tip, 中指_DIP, 中指_Tip, 无名指_DIP, 无名指_Tip, 小指_DIP, 小指_Tip
 SHORT_IDX = [23, 24, 4, 5, 9, 10, 19, 20, 14, 15]
 
-# 从手套到RYHand的缩放与偏置缩放系数调整映射路径
-CALIBRATION_FILE = os.path.join(project_root, "configs", "manus_calibration.json")
 
-# 万一json无法读取，使用此回退默认值
-FINGER_SCALES = [1.0, 1.0, 1.0, 1.0, 1.0]
-WRIST_OFFSET = [0.0, 0.0, 0.0]
-FINGER_POS_OFFSETS = [
-    [0.0, 0.0, 0.0],  # 拇指
-    [0.0, 0.0, 0.0],  # 食指
-    [0.0, 0.0, 0.0],  # 中指
-    [0.0, 0.0, 0.0],  # 无名指
-    [0.0, 0.0, 0.0]   # 小指
-]
-
-# 尝试通过json文件加载参数
-if os.path.exists(CALIBRATION_FILE):
-    try:
-        with open(CALIBRATION_FILE, 'r') as f:
-            calib = json.load(f)
-            FINGER_SCALES = calib.get("FINGER_SCALES", FINGER_SCALES)
-            WRIST_OFFSET = calib.get("WRIST_OFFSET", WRIST_OFFSET)
-            FINGER_POS_OFFSETS = calib.get("FINGER_POS_OFFSETS", FINGER_POS_OFFSETS)
-            print(f"[初始化] 成功从 {CALIBRATION_FILE} 加载校准配置文件")
-    except Exception as e:
-        print(f"[初始化] 读取文件出错 {CALIBRATION_FILE}: {e}, 回退使用默认参数。")
-else:
-    print(f"[初始化] 在 {CALIBRATION_FILE} 处未找到校准文件。回退使用默认参数。")
+# Calibration (FINGER_SCALES, FINGER_POS_OFFSETS, etc.) is loaded centrally
+# inside ssr.control.RyHand_IK at import time.
 
 
 class GloveDataReceiver:
@@ -350,280 +325,8 @@ class GloveDataReceiver:
         self.context.term()
 
 
-class RYHandIK:
-    """基于PyBullet执行睿言左手机械手逆向动力学计算的引擎核心"""
-    
-    def __init__(self, gui=True):
-        # 初始化PyBullet物理或直连服务端
-        if gui:
-            self.physics_client = p.connect(p.GUI)
-            p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
-            p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 0)
-            p.resetDebugVisualizerCamera(
-                cameraDistance=0.4,
-                cameraYaw=180,
-                cameraPitch=-30,
-                cameraTargetPosition=[0, 0, 0.05]
-            )
-        else:
-            self.physics_client = p.connect(p.DIRECT)
-        
-        p.setGravity(0, 0, 0)
-        p.setRealTimeSimulation(0)
-        
-        # 加载左手机械手描述文件模型 (Ruihand Left URDF)
-        urdf_path = os.path.join(project_root, "external", "Bidex_Manus_Teleop", "ryhand_left", "ruihand15z.urdf")
-        
-        # 建立世界基座及原生初始90度翻转补偿姿态
-        base_pos = [0, 0, 0]
-        base_orn = p.getQuaternionFromEuler([0, 0, np.pi/2])
-        
-        print(f"[IK求解器] 正在内存中渲染URDF模型: {urdf_path}")
-        self.robot_id = p.loadURDF(urdf_path, base_pos, base_orn, useFixedBase=True)
-        
-        self.num_joints = p.getNumJoints(self.robot_id)
-        print(f"[IK求解器] 模型初始化成功，载入总计 {self.num_joints} 个关节结构")
-        
-        # 生成内部ID字典映射供逆解检索调用
-        self._build_joint_info()
-        
-        # 注入目标可视化点位用于3D引擎显示
-        self._create_target_vis()
-        
-        # 预设输出状态池(存储20个主动关节坐标集)
-        self.joint_positions = np.zeros(20)
-        
-    def _build_joint_info(self):
-        """遍历映射从URDF字符串名称直接提取ID索引"""
-        self.joint_name_to_idx = {}
-        self.link_name_to_idx = {}
-        self.actuated_joints = []
-        
-        for i in range(self.num_joints):
-            joint_info = p.getJointInfo(self.robot_id, i)
-            joint_name = joint_info[1].decode('utf-8')
-            link_name = joint_info[12].decode('utf-8')
-            joint_type = joint_info[2]
-            
-            self.joint_name_to_idx[joint_name] = i
-            self.link_name_to_idx[link_name] = i
-            
-            if joint_type == p.JOINT_REVOLUTE:
-                self.actuated_joints.append(i)
-        
-        print(f"[IK求解器] 探测出具备驱动能力的可动(Revolute)关节共: {len(self.actuated_joints)} 处")
-        
-        # 收录充当IK终止端点(即指尖碰撞体)的作用端标识索引 (End-effector indices)
-        fingertip_links = ["fz15_Link", "fz25_Link", "fz35_Link", "fz45_Link", "fz55_Link"]
-        self.ee_indices = []
-        for link_name in fingertip_links:
-            if link_name in self.link_name_to_idx:
-                self.ee_indices.append(self.link_name_to_idx[link_name])
-                print(f"[IK求解器] 绑定受控指尖实体: {link_name} -> 系统内部指针 {self.link_name_to_idx[link_name]}")
-            else:
-                print(f"[IK求解器] 系统警告: 无法匹配指尖结构名称 {link_name}")
-        
-        print(f"[IK求解器] 终端求解锚点池生成完毕: {self.ee_indices}")
-    
-    def _create_target_vis(self):
-        """为PyBullet交互界面加载透明球体标识(可视化的IK捕捉目标)"""
-        ball_radius = 0.005
-        ball_shape = p.createCollisionShape(p.GEOM_SPHERE, radius=ball_radius)
-        base_mass = 0.001
-        base_pos = [0.1, 0.1, 0.1]
-        
-        self.target_balls = []
-        colors = [
-            [1, 1, 0, 1],    # 黄 - 拇指标识
-            [1, 0, 0, 1],    # 红 - 食指标识
-            [0, 1, 0, 1],    # 绿 - 中指标识
-            [0, 0, 1, 1],    # 蓝 - 无名指标识
-            [1, 0, 1, 1],    # 宫红 - 小指标识
-        ]
-        
-        for i in range(5):
-            for j in range(2):
-                ball_id = p.createMultiBody(
-                    baseMass=base_mass,
-                    baseCollisionShapeIndex=ball_shape,
-                    basePosition=base_pos
-                )
-                p.setCollisionFilterGroupMask(ball_id, -1, 0, 0) # 剥离物理碰撞碰撞防止干涉
-                alpha = 0.6 if j == 0 else 1.0
-                color = colors[i].copy()
-                color[3] = alpha
-                p.changeVisualShape(ball_id, -1, rgbaColor=color)
-                self.target_balls.append(ball_id)
-        
-    def _update_target_vis(self, hand_pos):
-        """推送更新虚拟可视化捕捉球位的坐标至引擎"""
-        for i, pos in enumerate(hand_pos):
-            if i < len(self.target_balls):
-                _, current_orn = p.getBasePositionAndOrientation(self.target_balls[i])
-                p.resetBasePositionAndOrientation(self.target_balls[i], pos, current_orn)
-    
-    def compute_ik(self, glove_data):
-        """
-        基于精简指尖网格触发一帧逆向动力学偏置结算
-        
-        参数:
-            glove_data: 字典封包格式包含人类手套手指跟踪与手腕平移点坐标数据 ('fingers', 'wrist')
-        
-        返回:
-            机械手控制系统所接驳的全部物理关节目标弧度(Radiant)张量池 (长度20位)
-        """
-        if glove_data is None or 'fingers' not in glove_data:
-            return None
-            
-        short_skeleton = glove_data['fingers']
-        wrist_orig = glove_data.get('wrist', [0, 0, 0])
 
-        if short_skeleton is None or len(short_skeleton) < 10:
-            return None
-        
-        # 将参数结构重列映射并结合JSON调参做数学偏差预处理修正
-        hand_pos = []
-        for i, pos in enumerate(short_skeleton):
-            finger_idx = i // 2
-            finger_offset = FINGER_POS_OFFSETS[finger_idx]
-            
-            x = pos[0] + finger_offset[0]
-            y = pos[1] + finger_offset[1]
-            z = pos[2] + finger_offset[2]
-            hand_pos.append([x, y, z])
-        
-        # 每帧更新前端渲染目标位置标识点
-        self._update_target_vis(hand_pos)
-        
-        # 单独抽取并孤立所有物理终点(Tip)数据，仅提供终极末端做强向位约束 (下标：1, 3, 5, 7, 9)
-        tip_indices = [1, 3, 5, 7, 9]
-        
-        fingertip_positions = []
-        for i, tip_idx in enumerate(tip_indices):
-            pos = hand_pos[tip_idx]
-            scale = FINGER_SCALES[i]
-            # 缩放骨骼比例以贴合目标硬件尺寸避免动作超出量程(拉伸)或不够大(张不开)
-            scaled_pos = [pos[0] * scale, pos[1] * scale, pos[2] * scale]
-            fingertip_positions.append(scaled_pos)
-        
-        num_ee = min(len(fingertip_positions), len(self.ee_indices))
-        
-        # 放行系统驱动滴答一帧用以完成力场解析
-        p.stepSimulation()
-        
-        try:
-            # 核心指令：要求PyBullet原生DLS算法使用最小二乘完成关节迭代，向指定端点空间推导角度反解
-            joint_poses = p.calculateInverseKinematics2(
-                self.robot_id,
-                self.ee_indices[:num_ee],
-                fingertip_positions[:num_ee],
-                solver=p.IK_DLS,
-                maxNumIterations=100,
-                residualThreshold=0.001,
-            )
-            
-            # 顺便推送解析完的姿态使虚拟手跟随变形以提供视觉验证
-            for i, joint_idx in enumerate(self.actuated_joints):
-                if i < len(joint_poses):
-                    p.setJointMotorControl2(
-                        bodyIndex=self.robot_id,
-                        jointIndex=joint_idx,
-                        controlMode=p.POSITION_CONTROL,
-                        targetPosition=joint_poses[i],
-                        targetVelocity=0,
-                        force=500,
-                        positionGain=0.3,
-                        velocityGain=1,
-                    )
-            
-            # 返回提取好的角度结构池缓存以供真机转发使用
-            self.joint_positions = np.array(joint_poses[:20], dtype=np.float32)
-            return self.joint_positions
-            
-        except Exception as e:
-            print(f"[IK计算错误] {e}")
-            return None
-    
-    def get_joint_positions(self):
-        """提供给外部拉取最近一条计算完毕指令的安全拷贝方法"""
-        return self.joint_positions.copy()
-    
-    def close(self):
-        """环境关停重置与中断"""
-        p.disconnect(self.physics_client)
-
-
-def ik_to_hand_angles(ik_joints):
-    """
-    负责将IK模拟解算的高维姿态(20关节) 降维转译到 Ruihand 真机的物理闭环控制器参数(15自由度指令)。
-    
-    仿真URDF文件映射架构(每手指4个旋转自由度,累计20指节):
-        每根手指内部顺序为: fzX1 (左右开合指根), fzX2 (MCP主弯折), fzX3(PIP指中弯折), fzX4(DIP指尖弯折)
-        - fzX1 开合物理结构限位: [-0.524, 0.524] 弧度 = [-30°, 30°]
-        - fzX2~X4 前屈物理限位: [0, 1.57] 弧度 = [0°, 90°]
-        
-    对应提取出 IK 数据张量池 结构索引：
-        拇指:  [0]=fz11, [1]=fz12, [2]=fz13, [3]=fz14
-        食指:  [4]=fz21, [5]=fz22, [6]=fz23, [7]=fz24
-        中指:  [8]=fz31, [9]=fz32, [10]=fz33, [11]=fz34
-        无名指:[12]=fz41, [13]=fz42, [14]=fz43, [15]=fz44
-        小指:  [16]=fz51, [17]=fz52, [18]=fz53, [19]=fz54
-    
-    真实五指机械手硬件设计架构(每根手指3个物理电机,累计15电机通道):
-        每根手指映射格式: [左右开合(side_swing), 近端弯折MCP(proximal_bend), 远端联动弯折(distal_bend)]
-        - 开合(side_swing): 取值 [-30°, 30°]
-        - 近端MCP(proximal_bend): 取值 [0°, 90°]
-        - 末端(distal_bend): 取值 [0°, 75°]
-    
-    转换映射法则:
-        - fzX1 -> 直接直通赋予 侧向开合驱动电机
-        - fzX2 -> 直接直通赋予 根部近端电机 (最主要的握持发力关节)
-        - (fzX3 + fzX4) -> 拟合糅合成单一参数赋予 远端联动电机
-          在真实灵巧手中，PIP和DIP(指中指尖)是通过一个单一拉钩马达连杆驱动并做耦合运动的，
-          所以必须对IK的独立双角度进行平均与限位衰减再下发。
-    
-    参数:
-        ik_joints: [numpy 数组] 保存IK解算后的20维纯物理弧度张量
-        
-    返回:
-        [numpy 数组] 含有15位降阶电机命令弧度目标列表，供驱动板使用
-    """
-    hand_angles = np.zeros(15, dtype=np.float64)
-    
-    # 物理软硬件夹角边界值限位 (转换成弧度)
-    limit_side = np.deg2rad(30)    # 极限阈值 +/- 30度
-    limit_prox = np.deg2rad(90)    # 极限阈值 0~90度弯曲
-    limit_dist = np.deg2rad(75)    # 极限阈值 0~75度联动弯曲
-    
-    for finger in range(5):
-        ik_base = finger * 4  # 按单指4关节计算偏移基址
-        hand_base = finger * 3  # 按电机板单指3通道寻找写入基址
-        
-        # 1. 左右侧边摆动开合 (fzX1) - 仅冻结非大拇指的侧摆自由度
-        side_swing = ik_joints[ik_base]
-        if finger == 0:
-            # 大拇指保持侧摆自由度
-            hand_angles[hand_base] = np.clip(side_swing, -limit_side, limit_side)
-        else:
-            # 其他手指冻结侧摆自由度
-            hand_angles[hand_base] = 0.0
-        
-        # 2. MCP根部基础弯折 (fzX2) - 主力对一对一直通
-        proximal = ik_joints[ik_base + 1]
-        hand_angles[hand_base + 1] = np.clip(proximal, 0, limit_prox)
-        
-        # 3. 远端联动拉绳合并 - 处理仿真IK的双关节(fzX3 PIP 与 fzX4 DIP)
-        pip_angle = ik_joints[ik_base + 2] 
-        dip_angle = ik_joints[ik_base + 3] 
-        
-        # 将双关节参数等强降维取均值，并以比例系数[75/90]缩放到适配最大75度的真实电机限幅区间内
-        combined_distal = (pip_angle + dip_angle) * 0.5
-        scaled_distal = combined_distal * (75.0 / 90.0)
-
-        # 保护性截断超量程指令避免电机烧毁
-        hand_angles[hand_base + 2] = np.clip(scaled_distal, 0, limit_dist)
-    
-    return hand_angles
+# RYHandIK and ik_to_hand_angles are imported from ssr.control.RyHand_IK (see top)
 
 
 def main():
@@ -659,7 +362,7 @@ def main():
     
     # 初始化核心算力管线与接收组件
     glove_receiver = GloveDataReceiver()
-    ryhand_ik = RYHandIK(gui=not args.no_gui)
+    ryhand_ik = RYHandIK(gui=(not args.no_gui))
     
     # 尝试桥接与挂载底层的物理手柄发送驱动串口环境 (除非主动挂起 dry-run 保护标签)
     hand_controller = None

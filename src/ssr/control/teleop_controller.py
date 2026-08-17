@@ -12,7 +12,7 @@ from ..hardware.realsense_worker import RealSenseWorker
 
 # Import utils
 from ..utils.visualization import TeleopDashboard
-from ..utils.camera_utils import get_video_index_by_id
+from ..utils.camera_utils import get_video_index_by_id, find_rgb_video_index_for_usb
 
 class TeleopController:
     """
@@ -65,21 +65,34 @@ class TeleopController:
             try:
                 rs_configs = self.hw_config.get('cameras', {}).get('realsense', [])
                 for cfg in rs_configs:
-                    idx = get_video_index_by_id(cfg['id'], cfg.get('offset', 0))
-                    if idx is not None:
-                        print(f"  RealSense ({cfg['name']}) found at index {idx}")
-                        rs = RealSenseWorker(camera_index=idx, width=1920, height=1080)
-                        
-                        # Apply digital zoom if specified in config
-                        zoom = cfg.get('zoom', 1.0)
+                    name = cfg.get('name', '')
+                    serial = (cfg.get('serial') or cfg.get('serial_number') or '').strip()
+                    zoom = cfg.get('zoom', 1.0)
+                    try:
+                        if serial:
+                            rs = RealSenseWorker(
+                                width=1920, height=1080, serial_number=serial
+                            )
+                        else:
+                            idx = get_video_index_by_id(cfg['id'], cfg.get('offset', 0))
+                            if idx is None and cfg.get('id'):
+                                idx, _ = find_rgb_video_index_for_usb(
+                                    cfg['id'], width=1920, height=1080
+                                )
+                            if idx is None:
+                                print(
+                                    f"  Warning: RealSense ({name}) not found with ID {cfg.get('id')}"
+                                )
+                                continue
+                            print(f"  RealSense ({name}) found at index {idx}")
+                            rs = RealSenseWorker(camera_index=idx, width=1920, height=1080)
                         if zoom > 1.0:
-                             print(f"    Applying {zoom}x digital zoom to {cfg['name']}")
-                             rs.set_zoom(zoom)
-                             
+                            print(f"    Applying {zoom}x digital zoom to {name}")
+                            rs.set_zoom(zoom)
                         rs.start()
-                        self.realsense_workers[cfg['name']] = rs
-                    else:
-                        print(f"  Warning: RealSense ({cfg['name']}) not found with ID {cfg['id']}")
+                        self.realsense_workers[name] = rs
+                    except Exception as ex:
+                        print(f"  Warning: RealSense ({name}) init failed: {ex}")
             except Exception as e:
                 print(f"Failed to init RealSense: {e}")
 

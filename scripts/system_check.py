@@ -154,16 +154,18 @@ def check_hand(port):
         print(f"    [FAIL] Exception checking port: {e}")
         return False
 
-def check_camera(index, name):
-    print(f"[-] Checking Camera {name} (Index {index})...")
+def check_camera(index, name, optional=False):
+    tag = "optional " if optional else ""
+    print(f"[-] Checking {tag}Camera {name} (Index {index})...")
+    bad = "[WARN]" if optional else "[FAIL]"
     if index is None:
-        print(f"    [FAIL] Camera ID not found in system.")
+        print(f"    {bad} Camera ID not found in system.")
         return False
 
     try:
         cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
         if not cap.isOpened():
-            print("    [FAIL] Could not open video device.")
+            print(f"    {bad} Could not open video device.")
             return False
         
         # Warmup / read
@@ -177,10 +179,10 @@ def check_camera(index, name):
              print(f"    [PASS] Frame captured. Resolution: {w}x{h}")
              return True
         else:
-             print("    [FAIL] Failed to read frame.")
+             print(f"    {bad} Failed to read frame.")
              return False
     except Exception as e:
-        print(f"    [FAIL] Exception: {e}")
+        print(f"    {bad} Exception: {e}")
         return False
 
 def check_t265():
@@ -301,7 +303,8 @@ def main():
     # Initialize status dictionaries for each category
     hardware_status = {}
     teleop_status = {}
-    sensors_status = {}
+    tactile_status = {}
+    realsense_status = {}
     
     # ==========================================
     # Hardware Checks
@@ -335,16 +338,16 @@ def main():
     
     if 'thumb' in fingertip_conf:
         thumb_idx = get_video_index_by_id(fingertip_conf['thumb']['id'], fingertip_conf['thumb'].get('offset', 0))
-        sensors_status['Cam_Thumb'] = check_camera(thumb_idx, "Thumb")
+        tactile_status['Cam_Thumb'] = check_camera(thumb_idx, "Thumb", optional=True)
         
     if 'index' in fingertip_conf:
         index_idx = get_video_index_by_id(fingertip_conf['index']['id'], fingertip_conf['index'].get('offset', 0))
-        sensors_status['Cam_Index'] = check_camera(index_idx, "Index")
+        tactile_status['Cam_Index'] = check_camera(index_idx, "Index", optional=True)
     
     rs_configs = config.get('cameras', {}).get('realsense', [])
     for i, cfg in enumerate(rs_configs):
         idx = get_video_index_by_id(cfg['id'], cfg.get('offset', 0))
-        sensors_status[f'Cam_RealSense_{i+1}'] = check_camera(idx, cfg.get('name', 'Unknown'))
+        realsense_status[f'Cam_RealSense_{i+1}'] = check_camera(idx, cfg.get('name', 'Unknown'))
     
     # ==========================================
     # Summary
@@ -380,9 +383,16 @@ def main():
         print("  \033[91m[FAIL]\033[0m Teleop not available (need both T265 and Manus Glove)")
         all_pass = False
     
-    # Sensors Summary
+    # Sensors Summary (tactile fingertip cams optional; RealSense required)
     print("\n[Sensors]")
-    for dev, passed in sensors_status.items():
+    if tactile_status:
+        print("  (Fingertip / tactile cameras optional)")
+        for dev, passed in tactile_status.items():
+            res_str = "\033[92m[OK]\033[0m" if passed else "\033[93m[--]\033[0m"
+            print(f"  {dev:<18} : {res_str}")
+        if not all(tactile_status.values()):
+            print("  \033[93m[NOTE] Tactile unavailable (fingertip camera(s) not connected).\033[0m")
+    for dev, passed in realsense_status.items():
         res_str = "\033[92m[OK]\033[0m" if passed else "\033[91m[FAIL]\033[0m"
         print(f"  {dev:<18} : {res_str}")
         if not passed:

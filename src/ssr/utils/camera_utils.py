@@ -1,6 +1,7 @@
 import subprocess
 import re
 import os
+import time
 
 def list_v4l2_devices():
     """
@@ -67,6 +68,59 @@ def get_video_index_by_id(stable_id, offset=0):
         return int(re.search(r'video(\d+)', node).group(1))
     
     return None
+
+
+def find_rgb_video_index_for_usb(stable_id, width=640, height=480, timeout_reads=30):
+    """
+    在指定 USB 稳定 ID 下的所有 /dev/video* 节点上依次尝试读取一帧彩色图，
+    找到第一个能稳定出 BGR 画面的节点。用于重启后 ``offset`` 与节点顺序变化时的回退。
+
+    Returns:
+        (video_index, offset) 或 (None, None)
+    """
+    try:
+        import cv2
+    except ImportError:
+        return None, None
+
+    devices = list_v4l2_devices()
+    if stable_id not in devices:
+        return None, None
+
+    nodes = devices[stable_id]
+    for offset, node in enumerate(nodes):
+        m = re.search(r"video(\d+)", node)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            cap.release()
+            continue
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if width:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
+        if height:
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
+        ok = False
+        for _ in range(timeout_reads):
+            ret, frame = cap.read()
+            if (
+                ret
+                and frame is not None
+                and len(frame.shape) == 3
+                and frame.shape[2] == 3
+                and frame.size > 0
+            ):
+                ok = True
+                break
+            time.sleep(0.05)
+        cap.release()
+        if ok:
+            return idx, offset
+
+    return None, None
+
 
 if __name__ == "__main__":
     # Test

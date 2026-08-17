@@ -17,10 +17,10 @@ cameras:
       offset: 0
   realsense:
   - name: rs_env
-    id: usb-0000:00:14.0-11
+    id: usb-0000:00:14.0-4
     offset: 4
     zoom: 1.0
   - name: rs_wrist
-    id: usb-0000:00:14.0-12
+    id: usb-0000:00:14.0-5.2
     offset: 4
     zoom: 1.0

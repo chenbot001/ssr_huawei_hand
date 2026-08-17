@@ -1,0 +1,23 @@
+# @package _global_
+defaults:
+  - /workspace/train_diffusion_unet_ssr_pickplace_fruit_workspace
+  - _self_
+
+# Project-specific overrides
+task:
+  dataset:
+    dataset_path: data/pickplace_fruit/ryhand_dp_dataset.zarr
+
+training:
+  device: "cuda:0"
+
+# Deployment (scripts/deploy_policy.py) — one-click: python scripts/deploy_policy.py
+# Override: python scripts/deploy_policy.py deployment.checkpoint_path=/abs/path/to/best.ckpt
+deployment:
+  checkpoint_path: data/pickplace_fruit/outputs/2026.03.23/21.03.28_train_diffusion_unet_hybrid_ssr_pickplace_image/checkpoints/latest.ckpt
+  device: ${training.device}
+  frequency: 15.0
+  steps_per_inference: 4
+  max_duration: 25.0
+  dry_run: false
+  no_start_pose: false

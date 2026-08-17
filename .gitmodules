@@ -1,6 +1,15 @@
+[submodule "external/Bidex_Manus_Teleop"]
+	path = external/Bidex_Manus_Teleop
+	url = https://github.com/leap-hand/Bidex_Manus_Teleop.git
+[submodule "external/diffusion_policy"]
+	path = external/diffusion_policy
+	url = https://github.com/real-stanford/diffusion_policy
 [submodule "external/gello_software"]
 	path = external/gello_software
 	url = https://github.com/wuphilipp/gello_software.git
 [submodule "external/openpi"]
 	path = external/openpi
 	url = https://github.com/wut19/openpi.git
+[submodule "src/dynamixel-sdk"]
+	path = src/dynamixel-sdk
+	url = https://github.com/ROBOTIS-GIT/DynamixelSDK.git

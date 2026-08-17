@@ -18,10 +18,10 @@ control:
 
 velocity_profiler:
   max_step: 0.15
+  min_step: 0.001        # deadband — T265 jitter below this is ignored (m)
 
 start_pose:
   # UR5 joint angles (radians) for the initial / reset position
-  # Corresponds to [0, -90, -110, -160, -90, 100] degrees
-  arm_joints: [0.0, -1.5708, -1.9199, -2.7925, -1.5708, 1.7453]
+  arm_joints: [-0.0575, -1.6630, -2.1179, -2.5305, -1.7108, 1.7728]
   move_speed: 0.5            # moveJ speed (rad/s)
   move_acceleration: 0.5     # moveJ acceleration (rad/s²)

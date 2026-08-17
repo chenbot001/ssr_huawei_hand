@@ -1,44 +1,34 @@
 #!/usr/bin/env python3
 """
-数据采集脚本 — 用于采集符合 diffusion_policy ReplayBuffer (zarr) 格式的遥操作数据集。
+数据采集脚本 (threaded) — 遥操作控制与数据录制在独立线程中运行,
+避免录制 I/O (RTDE 读、CAN 读、图像处理) 阻塞 servoL 指令流。
 
-控制逻辑参考 tests/test_teleop_manus.py，在遥操作过程中同步采集数据。
+Architecture:
+  ┌────────────────────────────────────────────────┐
+  │ Control Thread  (daemon, control_rate Hz)      │
+  │  T265 poll → servoL  |  Manus IK → hand       │
+  │  publishes hand_action to shared snapshot      │
+  │  pauses during reset via Event                 │
+  └────────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────┐
+  │ Main Thread                                    │
+  │  Keyboard listener                             │
+  │  Data recording at record_rate Hz              │
+  │  Episode management (flush / discard / pop)    │
+  │  Reset coordination (pauses control thread)    │
+  │  Cleanup & zarr finalization                   │
+  └────────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────┐
+  │ Background threads (unchanged from original):  │
+  │  GloveDataReceiver (ZMQ)                       │
+  │  RealSenseWorker × 2 (camera capture)          │
+  └────────────────────────────────────────────────┘
 
-数据集结构:
-  observation (观测):
-    - arm_eef_pose:        UR机械臂末端位姿 [x, y, z, rx, ry, rz]  (6D)
-    - hand_joint_angles:   Ruiyan灵巧手关节角 (15D, 弧度)
-    - camera_env:          环境 RealSense 相机画面  (H, W, 3) uint8
-    - camera_wrist:        手腕 RealSense 相机画面  (H, W, 3) uint8  (已旋转180°校正)
+Dataset schema identical to collect_data.py.
 
-  action (动作):
-    - action_hand_joints:  Manus动捕手套 retarget 到灵巧手的关节角 (15D, 弧度)
-    - action_eef_delta:    T265相机测量的末端相对位移/旋转增量 [dx,dy,dz,drx,dry,drz] (6D)
-
-存储格式:  zarr DirectoryStore
-  root/
-    data/
-      arm_eef_pose          (N, 6)    float32
-      hand_joint_angles     (N, 15)   float32
-      camera_env            (N, H, W, 3) uint8
-      camera_wrist          (N, H, W, 3) uint8
-      action_hand_joints    (N, 15)   float32
-      action_eef_delta      (N, 6)    float32
-    meta/
-      episode_ends          (E,)      int64
- 
-用法:
-    1. 确保 UR 机械臂已上电、Ruiyan 手已通过 CAN 连接、
-       RealSense RGB 相机已接入、T265 追踪相机已接入、MANUS SDK 已运行
-    2. python scripts/collect_data.py [选项]
-    3. 按 空格键 — 接合/解除离合 (控制机械臂跟随)
-    4. 按 's'   — 开始 / 结束录制一段 episode
-    5. 按 'd'   — 录制中: 丢弃当前未保存片段; 空闲时: 从 zarr 删除最近一段已保存 episode
-    6. 按 'q'   — 保存数据集并退出
-    7. Ctrl+C   — 紧急退出 (会尝试保存)
-       若整次运行未写入任何 episode，退出时将删除本次创建的空 zarr 目录
-
-依赖: pip install zarr numcodecs pyrealsense2 numpy opencv-python pybullet pyzmq pynput python-can scipy
+Usage:
+    python scripts/collect_data_threaded.py [options]
+    (same CLI arguments as collect_data.py)
 """
 
 import argparse
@@ -83,7 +73,7 @@ from ssr.utils.camera_utils import get_video_index_by_id, find_rgb_video_index_f
 from ssr.control.RyHand_IK import RYHandIK, ik_to_hand_angles
 
 # ============================================================================
-# 手套与 IK 配置 (从 configs/hardware_config.yaml 加载)
+# 手套与 IK 配置
 # ============================================================================
 _hw_config = get_hardware_config()
 _manus_config = _hw_config.get('manus_glove', {})
@@ -95,12 +85,8 @@ NUM_JOINTS = 25
 VALUES_PER_JOINT = 7
 SHORT_IDX = [23, 24, 4, 5, 9, 10, 19, 20, 14, 15]
 
-
-# Calibration (FINGER_SCALES, FINGER_POS_OFFSETS, etc.) is loaded centrally
-# inside ssr.control.RyHand_IK at import time.
-
 # ============================================================================
-# 坐标系 & 参数 (从 configs/teleop_config.yaml 加载)
+# 坐标系 & 参数
 # ============================================================================
 _teleop_config = get_teleop_config()
 _servo_cfg = _teleop_config.get('servo', {})
@@ -115,6 +101,9 @@ SERVO_LOOKAHEAD = _servo_cfg.get('lookahead_time', 0.1)
 SERVO_GAIN = _servo_cfg.get('gain', 300)
 HAND_MOTOR_SPEED = _control_cfg.get('hand_motor_speed', 1000)
 HAND_RESET_SPEED = _control_cfg.get('hand_reset_speed', 500)
+_profiler_cfg = _teleop_config.get('velocity_profiler', {})
+PROFILER_MAX_STEP = _profiler_cfg.get('max_step', 0.15)  # max Cartesian translation step per control cycle (m)
+PROFILER_MIN_STEP = _profiler_cfg.get('min_step', 0.001)  # deadband — steps smaller than this are suppressed (m)
 T265_TO_UR_ALIGN = np.array([
     [ 0,  0, -1,  0],
     [-1,  0,  0,  0],
@@ -124,10 +113,9 @@ T265_TO_UR_ALIGN = np.array([
 
 
 # ============================================================================
-# 辅助函数 (与 tests/test_teleop_manus.py 保持一致)
+# 辅助函数
 # ============================================================================
 def create_pose_matrix(translation, rotation_quat):
-    """根据 pyrealsense2 的 translation 和 rotation 创建 4x4 齐次矩阵"""
     matrix = np.eye(4)
     matrix[:3, :3] = R.from_quat([
         rotation_quat.x, rotation_quat.y,
@@ -138,14 +126,12 @@ def create_pose_matrix(translation, rotation_quat):
 
 
 def matrix_to_pose_vector(matrix):
-    """4x4 矩阵 → [x,y,z, rx,ry,rz] (旋转向量表示)"""
     pos = matrix[:3, 3]
     rot = R.from_matrix(matrix[:3, :3]).as_rotvec()
     return [pos[0], pos[1], pos[2], rot[0], rot[1], rot[2]]
 
 
 def pose_vector_to_matrix(pose_vec):
-    """[x,y,z, rx,ry,rz] → 4x4 齐次矩阵"""
     matrix = np.eye(4)
     matrix[:3, 3] = pose_vec[:3]
     matrix[:3, :3] = R.from_rotvec(pose_vec[3:]).as_matrix()
@@ -153,7 +139,7 @@ def pose_vector_to_matrix(pose_vec):
 
 
 # ============================================================================
-# GloveDataReceiver — 与 tests/test_teleop_manus.py 一致
+# GloveDataReceiver
 # ============================================================================
 class GloveDataReceiver:
     def __init__(self, left_sn=LEFT_GLOVE_SN, right_sn=RIGHT_GLOVE_SN):
@@ -213,23 +199,17 @@ class GloveDataReceiver:
         self.context.term()
 
 
-
-# RYHandIK and ik_to_hand_angles are imported from ssr.control.RyHand_IK (see top)
-
-
 # ============================================================================
-# 全局状态
+# RecordingState
 # ============================================================================
 class RecordingState:
-    """管理录制 & 离合 & 复位 状态的线程安全类"""
-
     def __init__(self):
         self.lock = threading.Lock()
         self.recording = False
         self.should_quit = False
         self.should_discard = False
         self.should_reset = False
-        self.clutch_active = False  # 离合: 空格键切换
+        self.clutch_active = False
 
     def toggle_recording(self):
         with self.lock:
@@ -292,10 +272,204 @@ class RecordingState:
 
 
 # ============================================================================
+# ControlThread — dedicated thread for T265+servoL and Manus+hand at 80 Hz
+# ============================================================================
+class ControlThread(threading.Thread):
+    """
+    Runs the real-time teleop loop independently of data recording.
+    Publishes the latest IK hand angles to a shared snapshot so the
+    recording path can read them without blocking.
+    """
+
+    def __init__(
+        self,
+        state: RecordingState,
+        t265_pipeline,
+        ur_arm,
+        glove_receiver,
+        ryhand_ik,
+        hand_ctrl,
+        control_dt: float,
+    ):
+        super().__init__(daemon=True)
+        self.state = state
+        self.t265_pipeline = t265_pipeline
+        self.ur_arm = ur_arm
+        self.glove_receiver = glove_receiver
+        self.ryhand_ik = ryhand_ik
+        self.hand_ctrl = hand_ctrl
+        self.control_dt = control_dt
+
+        # shared with main thread for calibration/reset
+        self.base_t265_matrix = None
+        self.base_ur_matrix = None
+
+        # published snapshot (read by data thread)
+        self._snapshot_lock = threading.Lock()
+        self._hand_action = np.zeros(15, dtype=np.float32)
+
+        # CAN bus lock: protects set_angles (control) vs get_angles (data)
+        self.hand_hw_lock = threading.Lock()
+
+        # pause mechanism for reset sequences
+        self._resume_event = threading.Event()
+        self._resume_event.set()  # starts running
+
+        # internal
+        self._was_clutch_active = False
+        self._clutch_t265_matrix = None
+        self._clutch_ur_matrix = None
+        self._prev_tcp_target = None  # last sent TCP position for step clamping
+        self._glove_connected = False
+
+        # timing diagnostics
+        self._loop_overrun_count = 0
+
+    # ---- snapshot API ----
+
+    def get_hand_action(self) -> np.ndarray:
+        with self._snapshot_lock:
+            return self._hand_action.copy()
+
+    def set_calibration(self, base_t265, base_ur):
+        self.base_t265_matrix = base_t265
+        self.base_ur_matrix = base_ur
+
+    def pause(self):
+        """Pause the control loop (blocks until the loop has yielded)."""
+        self._resume_event.clear()
+
+    def resume(self):
+        self._resume_event.set()
+
+    # ---- main loop ----
+
+    def run(self):
+        last_time = time.time()
+
+        while not self.state.quit_requested:
+            # honour pause requests (e.g. during reset)
+            self._resume_event.wait()
+
+            start_time = time.time()
+            dt = start_time - last_time
+            if dt <= 0:
+                dt = 0.001
+            last_time = start_time
+
+            # --- Hand control (Manus → IK → RyHand) ---
+            if self.glove_receiver is not None and self.ryhand_ik is not None:
+                skeleton_data = self.glove_receiver.get_data()
+
+                if skeleton_data is not None and not self._glove_connected:
+                    print(f"\n[信息] 成功与 MANUS 穿戴套件建立心跳反馈!")
+                    self._glove_connected = True
+
+                if skeleton_data is not None:
+                    ik_positions = self.ryhand_ik.compute_ik(skeleton_data)
+                    if ik_positions is not None:
+                        hand_angles = ik_to_hand_angles(ik_positions)
+                        with self._snapshot_lock:
+                            self._hand_action = hand_angles.astype(np.float32)
+                        if self.hand_ctrl is not None:
+                            with self.hand_hw_lock:
+                                self.hand_ctrl.set_angles(
+                                    hand_angles, speed=HAND_MOTOR_SPEED, radians=True)
+
+            # --- Arm control (T265 → servoL) ---
+            if self.t265_pipeline is not None:
+                frames = self.t265_pipeline.poll_for_frames()
+                if frames:
+                    pose_frame = frames.get_pose_frame()
+                    if pose_frame:
+                        pose_data = pose_frame.get_pose_data()
+                        if pose_data.tracker_confidence < 2:
+                            continue
+                        current_t265_matrix = create_pose_matrix(
+                            pose_data.translation, pose_data.rotation)
+
+                        if self.state.is_clutch_active and self.ur_arm is not None:
+                            if not self._was_clutch_active:
+                                self._clutch_t265_matrix = current_t265_matrix.copy()
+                                self._clutch_ur_matrix = pose_vector_to_matrix(
+                                    self.ur_arm.rtde_r.getActualTCPPose())
+                                self._prev_tcp_target = self._clutch_ur_matrix[:3, 3].copy()
+                                self._was_clutch_active = True
+
+                            if (self.base_t265_matrix is not None
+                                    and self.base_ur_matrix is not None):
+                                rot_delta = np.linalg.inv(
+                                    self._clutch_t265_matrix) @ current_t265_matrix
+                                rot_delta[:3, 3] = 0
+                                mapped_rot = (T265_TO_UR_ALIGN
+                                              @ rot_delta @ T265_TO_UR_ALIGN.T)
+                                mapped_rv = R.from_matrix(
+                                    mapped_rot[:3, :3]).as_rotvec()
+
+                                adj_ry = -mapped_rv[1]
+                                adj_rx = mapped_rv[2]
+                                adj_rz = mapped_rv[0]
+                                adj_rot_mat = R.from_rotvec(
+                                    [adj_rx, adj_ry, adj_rz]).as_matrix()
+
+                                target_rot = (self._clutch_ur_matrix[:3, :3]
+                                              @ adj_rot_mat)
+                                trans_delta = (current_t265_matrix[:3, 3]
+                                               - self._clutch_t265_matrix[:3, 3])
+                                mapped_trans = (T265_TO_UR_ALIGN[:3, :3]
+                                                @ trans_delta * TRANSLATION_SCALE)
+
+                                target = np.eye(4)
+                                target[:3, :3] = target_rot
+                                desired_pos = self._clutch_ur_matrix[:3, 3] + mapped_trans
+                                step = desired_pos - self._prev_tcp_target
+                                step_norm = np.linalg.norm(step)
+                                if step_norm > PROFILER_MAX_STEP:
+                                    step = step * (PROFILER_MAX_STEP / step_norm)
+                                if step_norm > PROFILER_MIN_STEP:
+                                    self._prev_tcp_target = self._prev_tcp_target + step
+                                target[:3, 3] = self._prev_tcp_target
+
+                                try:
+                                    self.ur_arm.rtde_c.servoL(
+                                        matrix_to_pose_vector(target),
+                                        SERVO_SPEED, SERVO_ACCEL, SERVO_DT,
+                                        SERVO_LOOKAHEAD, SERVO_GAIN)
+                                except Exception:
+                                    pass
+                        else:
+                            if self._was_clutch_active:
+                                if self.ur_arm is not None:
+                                    try:
+                                        self.ur_arm.rtde_c.servoStop()
+                                    except Exception:
+                                        pass
+                                self._was_clutch_active = False
+
+            # --- timing ---
+            elapsed = time.time() - start_time
+            if elapsed < self.control_dt:
+                time.sleep(self.control_dt - elapsed)
+            else:
+                self._loop_overrun_count += 1
+
+    def force_disengage(self):
+        """Disengage clutch and stop servo (called from main thread during reset)."""
+        self.state.set_clutch(False)
+        self._was_clutch_active = False
+        if self.ur_arm is not None:
+            try:
+                self.ur_arm.rtde_c.servoStop()
+            except Exception:
+                pass
+
+
+# ============================================================================
 # 主函数
 # ============================================================================
 def main():
-    parser = argparse.ArgumentParser(description="数据采集脚本 (diffusion_policy 格式)")
+    parser = argparse.ArgumentParser(
+        description="数据采集脚本 — threaded (diffusion_policy 格式)")
     parser.add_argument("--output", "-o", type=str, default=None,
                         help="输出 zarr 目录路径。默认: data/collected_YYYYMMDD_HHMMSS.zarr")
     parser.add_argument("--record-rate", type=float, default=15.0,
@@ -310,7 +484,6 @@ def main():
                         help="仅测试数据流，不连接真实硬件 (UR / RuiYan)")
     args = parser.parse_args()
 
-    # ---------- 输出路径 ----------
     if args.output is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         args.output = os.path.join(project_root, "data", f"collected_{timestamp}.zarr")
@@ -320,25 +493,24 @@ def main():
 
     img_w, img_h = args.img_width, args.img_height
     control_dt = 1.0 / args.control_rate
-    record_interval = 1.0 / args.record_rate  # 数据记录间隔
+    record_interval = 1.0 / args.record_rate
 
     print("=" * 70)
-    print("     数据采集系统 (diffusion_policy zarr 格式)")
+    print("     数据采集系统 — THREADED (diffusion_policy zarr 格式)")
     print("=" * 70)
     print(f"  输出路径     : {args.output}")
-    print(f"  控制频率     : {args.control_rate} Hz")
-    print(f"  记录频率     : {args.record_rate} Hz")
+    print(f"  控制频率     : {args.control_rate} Hz  (dedicated thread)")
+    print(f"  记录频率     : {args.record_rate} Hz   (main thread)")
     print(f"  图像分辨率   : {img_w} x {img_h}")
     print(f"  Dry-run      : {args.dry_run}")
     print("-" * 70)
 
     # ====================================================================
-    # 1. 初始化所有硬件
+    # 1. 初始化所有硬件 (identical to collect_data.py)
     # ====================================================================
     hw_config = get_hardware_config()
     state = RecordingState()
 
-    # --- UR5 机械臂 ---
     ur_arm = None
     if not args.dry_run:
         try:
@@ -349,7 +521,6 @@ def main():
     else:
         print("[~] Dry-run: 跳过 UR5 连接")
 
-    # --- Ruiyan 灵巧手 ---
     hand_ctrl = None
     if not args.dry_run:
         try:
@@ -360,13 +531,10 @@ def main():
     else:
         print("[~] Dry-run: 跳过 Ruiyan 手连接")
 
-    # --- RealSense RGB 相机 (通过 USB ID 绑定) ---
     rs_configs = hw_config.get('cameras', {}).get('realsense', [])
-    # 按名称索引: rs_env → 环境相机, rs_wrist → 手腕相机
     rs_by_name = {cfg.get('name', ''): cfg for cfg in rs_configs}
 
     def _init_rs_camera(role, cfg):
-        """根据 hardware_config 初始化 RealSense：优先序列号(SDK)，否则 V4L2+offset，失败则自动探测 RGB 节点。"""
         if cfg is None:
             print(f"[✗] 未在配置中找到 {role} 相机设置")
             return None
@@ -378,8 +546,7 @@ def main():
         if serial:
             try:
                 worker = RealSenseWorker(
-                    width=img_w, height=img_h, serial_number=serial
-                )
+                    width=img_w, height=img_h, serial_number=serial)
             except (ValueError, ImportError) as e:
                 print(f"[✗] {role} 相机 SDK 初始化失败: {e}")
                 return None
@@ -444,14 +611,12 @@ def main():
     rs_env_camera = _init_rs_camera("Env (环境)", rs_by_name.get("rs_env"))
     rs_wrist_camera = _init_rs_camera("Wrist (手腕)", rs_by_name.get("rs_wrist"))
 
-    # --- T265 追踪相机（可选 serial：按序列号打开，避免多相机时选错设备）---
     t265_pipeline = None
     try:
         t265_pipeline = rs.pipeline()
         t265_config = rs.config()
         t265_serial = (hw_config.get("t265") or {}).get("serial") or hw_config.get(
-            "t265_serial"
-        )
+            "t265_serial")
         if t265_serial:
             t265_serial = str(t265_serial).strip()
         if t265_serial:
@@ -473,7 +638,6 @@ def main():
         t265_pipeline = None
 
     def _t265_wait_pose(timeout_ms: int = 8000, attempts: int = 6):
-        """阻塞等待 T265 位姿帧；带重试，减轻复位/多 RealSense 占 USB 后的偶发超时。"""
         if t265_pipeline is None:
             return None
         last_err = None
@@ -489,7 +653,6 @@ def main():
             print(f"[✗] T265 取帧失败（已重试 {attempts} 次）: {last_err}")
         return None
 
-    # --- Manus 手套 + IK ---
     glove_receiver = None
     ryhand_ik = None
     try:
@@ -502,7 +665,7 @@ def main():
     print("-" * 70)
 
     # ====================================================================
-    # 2. T265 + UR 初始基座校准 (与 tests/test_teleop_manus.py 一致)
+    # 2. T265 + UR 初始基座校准
     # ====================================================================
     base_t265_matrix = None
     base_ur_matrix = None
@@ -514,8 +677,10 @@ def main():
         pose_frame = frames.get_pose_frame() if frames else None
         if pose_frame:
             pose_data = pose_frame.get_pose_data()
-            base_t265_matrix = create_pose_matrix(pose_data.translation, pose_data.rotation)
-            base_ur_matrix = pose_vector_to_matrix(ur_arm.rtde_r.getActualTCPPose())
+            base_t265_matrix = create_pose_matrix(
+                pose_data.translation, pose_data.rotation)
+            base_ur_matrix = pose_vector_to_matrix(
+                ur_arm.rtde_r.getActualTCPPose())
             print("[✓] 初始校准完成: T265/UR 基座位姿已锁定")
         else:
             print("[✗] 校准失败: 无法获取 T265 初始帧")
@@ -525,15 +690,30 @@ def main():
         print("[!] T265 或 UR 不可用，机械臂遥操作功能受限")
 
     # ====================================================================
-    # 2b. 起始位姿 (从 teleop_config.yaml 加载)
+    # 2b. 起始位姿
     # ====================================================================
     _start_pose_cfg = _teleop_config.get('start_pose', {})
     start_pose_joints = _start_pose_cfg.get('arm_joints')
     start_move_speed = _start_pose_cfg.get('move_speed', 0.5)
     start_move_accel = _start_pose_cfg.get('move_acceleration', 0.5)
 
+    # ====================================================================
+    # 3. Create and start the control thread
+    # ====================================================================
+    ctrl_thread = ControlThread(
+        state=state,
+        t265_pipeline=t265_pipeline,
+        ur_arm=ur_arm,
+        glove_receiver=glove_receiver,
+        ryhand_ik=ryhand_ik,
+        hand_ctrl=hand_ctrl,
+        control_dt=control_dt,
+    )
+    ctrl_thread.set_calibration(base_t265_matrix, base_ur_matrix)
+
     def _move_to_start_pose():
-        """将 UR 机械臂移动至预设起始位姿，同时重置灵巧手。"""
+        """Move UR to start pose, reset hand, recalibrate T265/UR base.
+        Must be called while control thread is paused."""
         nonlocal base_t265_matrix, base_ur_matrix
 
         if ur_arm is not None and start_pose_joints is not None:
@@ -545,12 +725,12 @@ def main():
         elif start_pose_joints is None:
             print("[!] teleop_config.yaml 中未定义 start_pose.arm_joints，跳过")
 
-        # 重置灵巧手到零位
         if hand_ctrl is not None:
-            hand_ctrl.set_angles(np.zeros(15), speed=HAND_RESET_SPEED, radians=True)
+            with ctrl_thread.hand_hw_lock:
+                hand_ctrl.set_angles(
+                    np.zeros(15), speed=HAND_RESET_SPEED, radians=True)
             time.sleep(0.3)
 
-        # 重新校准 T265 / UR 基座 (消除复位移动期间累积的漂移)
         if t265_pipeline is not None and ur_arm is not None:
             time.sleep(0.5)
             frames = _t265_wait_pose()
@@ -561,27 +741,31 @@ def main():
                     pose_data.translation, pose_data.rotation)
                 base_ur_matrix = pose_vector_to_matrix(
                     ur_arm.rtde_r.getActualTCPPose())
+                ctrl_thread.set_calibration(base_t265_matrix, base_ur_matrix)
                 print("[✓] T265/UR 基座位姿已重新校准")
             else:
-                print("[!] 复位后 T265 基座未更新（沿用复位前基座；若遥操作飘移可再按 'r' 或重插 T265）")
+                print("[!] 复位后 T265 基座未更新")
 
-    # 首次启动: 移动到起始位姿
     if not args.dry_run:
         _move_to_start_pose()
     else:
         print("[~] Dry-run: 跳过起始位姿移动")
 
+    # Start control thread after initial calibration
+    ctrl_thread.start()
+    print("[✓] 控制线程已启动 (独立运行)")
+
     # ====================================================================
-    # 3. 键盘监听
+    # 4. 键盘监听
     # ====================================================================
     def on_press(key):
         try:
             if key == keyboard.Key.space:
                 is_clutch = state.toggle_clutch()
                 if is_clutch:
-                    print("\n[状态] 🤖 离合已接合(ENGAGED) - 机械臂跟随移动")
+                    print("\n[状态] 离合已接合(ENGAGED) - 机械臂跟随移动")
                 else:
-                    print("\n[状态] ⏸️  离合已解除(DISENGAGED) - 机械臂暂停")
+                    print("\n[状态] 离合已解除(DISENGAGED) - 机械臂暂停")
             elif hasattr(key, 'char'):
                 if key.char == 's':
                     is_rec = state.toggle_recording()
@@ -614,7 +798,7 @@ def main():
     print("=" * 70)
 
     # ====================================================================
-    # 4. zarr 存储初始化
+    # 5. zarr 存储初始化
     # ====================================================================
     store = zarr.DirectoryStore(args.output)
     root = zarr.group(store=store, overwrite=True)
@@ -631,18 +815,24 @@ def main():
     chunk_time = 256
     arr_arm_eef = data_group.zeros('arm_eef_pose', shape=(0, 6), dtype=np.float32,
                                     chunks=(chunk_time, 6), compressor=compressor)
-    arr_hand_joints = data_group.zeros('hand_joint_angles', shape=(0, 15), dtype=np.float32,
+    arr_hand_joints = data_group.zeros('hand_joint_angles', shape=(0, 15),
+                                        dtype=np.float32,
                                         chunks=(chunk_time, 15), compressor=compressor)
-    arr_camera_env = data_group.zeros('camera_env', shape=(0, img_h, img_w, 3), dtype=np.uint8,
-                                      chunks=(1, img_h, img_w, 3), compressor=img_compressor)
-    arr_camera_wrist = data_group.zeros('camera_wrist', shape=(0, img_h, img_w, 3), dtype=np.uint8,
-                                         chunks=(1, img_h, img_w, 3), compressor=img_compressor)
-    arr_action_hand = data_group.zeros('action_hand_joints', shape=(0, 15), dtype=np.float32,
+    arr_camera_env = data_group.zeros('camera_env', shape=(0, img_h, img_w, 3),
+                                      dtype=np.uint8,
+                                      chunks=(1, img_h, img_w, 3),
+                                      compressor=img_compressor)
+    arr_camera_wrist = data_group.zeros('camera_wrist', shape=(0, img_h, img_w, 3),
+                                         dtype=np.uint8,
+                                         chunks=(1, img_h, img_w, 3),
+                                         compressor=img_compressor)
+    arr_action_hand = data_group.zeros('action_hand_joints', shape=(0, 15),
+                                        dtype=np.float32,
                                         chunks=(chunk_time, 15), compressor=compressor)
-    arr_action_delta = data_group.zeros('action_eef_delta', shape=(0, 6), dtype=np.float32,
+    arr_action_delta = data_group.zeros('action_eef_delta', shape=(0, 6),
+                                          dtype=np.float32,
                                           chunks=(chunk_time, 6), compressor=compressor)
 
-    # episode 内临时缓存
     ep_arm_eef = []
     ep_hand_joints = []
     ep_camera_env = []
@@ -654,33 +844,23 @@ def main():
     total_episodes = 0
 
     # ====================================================================
-    # 5. 主控制循环 (与 tests/test_teleop_manus.py 控制逻辑一致)
+    # 6. Main loop — data recording only (control runs in ControlThread)
     # ====================================================================
     print("\n系统就绪，等待按键操作...\n")
 
-    # 离合切换时的基准位姿
-    clutch_t265_matrix = None
-    clutch_ur_matrix = None
-    was_clutch_active = False
-
-    # 当前 retarget 到的手部关节角 (15D, 弧度)
-    current_hand_action = np.zeros(15, dtype=np.float32)
-
-    # 上一次录制步的 UR 末端位姿矩阵 (用于计算 action_eef_delta)
     prev_arm_pose_for_delta = None
-
-    # 手套连接状态
-    glove_connected = False
-
-    # 上次记录数据的时间
     last_record_time = 0.0
 
-    last_time = time.time()
+    def _clear_episode_buffers():
+        ep_arm_eef.clear()
+        ep_hand_joints.clear()
+        ep_camera_env.clear()
+        ep_camera_wrist.clear()
+        ep_action_hand.clear()
+        ep_action_delta.clear()
 
     def _flush_episode():
-        """将当前 episode 缓冲写入 zarr"""
         nonlocal total_steps, total_episodes
-
         ep_len = len(ep_arm_eef)
         if ep_len == 0:
             return
@@ -691,39 +871,41 @@ def main():
         arr_arm_eef[total_steps:new_total] = np.array(ep_arm_eef, dtype=np.float32)
 
         arr_hand_joints.resize(new_total, 15)
-        arr_hand_joints[total_steps:new_total] = np.array(ep_hand_joints, dtype=np.float32)
+        arr_hand_joints[total_steps:new_total] = np.array(
+            ep_hand_joints, dtype=np.float32)
 
         arr_camera_env.resize(new_total, img_h, img_w, 3)
-        arr_camera_env[total_steps:new_total] = np.array(ep_camera_env, dtype=np.uint8)
+        arr_camera_env[total_steps:new_total] = np.array(
+            ep_camera_env, dtype=np.uint8)
 
         arr_camera_wrist.resize(new_total, img_h, img_w, 3)
-        arr_camera_wrist[total_steps:new_total] = np.array(ep_camera_wrist, dtype=np.uint8)
+        arr_camera_wrist[total_steps:new_total] = np.array(
+            ep_camera_wrist, dtype=np.uint8)
 
         arr_action_hand.resize(new_total, 15)
-        arr_action_hand[total_steps:new_total] = np.array(ep_action_hand, dtype=np.float32)
+        arr_action_hand[total_steps:new_total] = np.array(
+            ep_action_hand, dtype=np.float32)
 
         arr_action_delta.resize(new_total, 6)
-        arr_action_delta[total_steps:new_total] = np.array(ep_action_delta, dtype=np.float32)
+        arr_action_delta[total_steps:new_total] = np.array(
+            ep_action_delta, dtype=np.float32)
 
         episode_ends_arr.resize(total_episodes + 1)
         episode_ends_arr[total_episodes] = new_total
 
         total_steps = new_total
         total_episodes += 1
-        print(f"\n[SAVE] Episode {total_episodes} 已写入 ({ep_len} 步, 总计 {total_steps} 步)")
+        print(f"\n[SAVE] Episode {total_episodes} 已写入 "
+              f"({ep_len} 步, 总计 {total_steps} 步)")
 
     def _pop_last_episode():
-        """从 zarr 中删除最后一段已落盘的 episode（与 ReplayBuffer episode_ends 约定一致）"""
         nonlocal total_steps, total_episodes
         if total_episodes <= 0:
             print("\n[INFO] 没有已保存的 episode，无法删除")
             return
         ends = episode_ends_arr[:]
         last_end = int(ends[-1])
-        if total_episodes >= 2:
-            new_total = int(ends[-2])
-        else:
-            new_total = 0
+        new_total = int(ends[-2]) if total_episodes >= 2 else 0
         removed_1based = total_episodes
         last_len = last_end - new_total
 
@@ -742,184 +924,62 @@ def main():
 
     try:
         while not state.quit_requested:
-            start_time = time.time()
-            dt = start_time - last_time
-            if dt <= 0:
-                dt = 0.001
-            last_time = start_time
+            iter_start = time.time()
 
-            # ------ 丢弃请求处理 ------
+            # ------ Discard handling ------
             if state.discard_requested:
                 if state.is_recording:
-                    ep_arm_eef.clear()
-                    ep_hand_joints.clear()
-                    ep_camera_env.clear()
-                    ep_camera_wrist.clear()
-                    ep_action_hand.clear()
-                    ep_action_delta.clear()
+                    _clear_episode_buffers()
                     prev_arm_pose_for_delta = None
                     state.toggle_recording()
                     state.clear_discard()
                     print("[INFO] 当前录制已丢弃（未写入 zarr）")
                 else:
-                    ep_arm_eef.clear()
-                    ep_hand_joints.clear()
-                    ep_camera_env.clear()
-                    ep_camera_wrist.clear()
-                    ep_action_hand.clear()
-                    ep_action_delta.clear()
+                    _clear_episode_buffers()
                     prev_arm_pose_for_delta = None
                     _pop_last_episode()
                     state.clear_discard()
 
-            # ------ 复位请求处理 ------
+            # ------ Reset handling (pause control thread) ------
             if state.reset_requested:
-                # 如果正在录制，先结束并写入当前 episode
                 if state.is_recording:
                     state.toggle_recording()
                 if ep_arm_eef:
                     _flush_episode()
-                    ep_arm_eef.clear()
-                    ep_hand_joints.clear()
-                    ep_camera_env.clear()
-                    ep_camera_wrist.clear()
-                    ep_action_hand.clear()
-                    ep_action_delta.clear()
+                    _clear_episode_buffers()
                 prev_arm_pose_for_delta = None
 
-                # 强制解除离合，防止 T265 在复位期间干扰
-                state.set_clutch(False)
-                was_clutch_active = False
+                ctrl_thread.force_disengage()
+                ctrl_thread.pause()
 
-                # 停止任何进行中的 servoL 指令
-                if ur_arm is not None:
-                    try:
-                        ur_arm.rtde_c.servoStop()
-                    except Exception:
-                        pass
-
-                # 移动到起始位姿 + 重置手部 + 重新校准 T265
                 _move_to_start_pose()
 
+                ctrl_thread.resume()
                 state.clear_reset()
                 print("[RESET] 复位完成。按空格接合离合，按 's' 开始录制下一段 episode")
 
-            # ==============================================================
-            # A) 手部控制 — 始终运行 (与 tests/test_teleop_manus.py 一致)
-            # ==============================================================
-            if glove_receiver is not None and ryhand_ik is not None:
-                skeleton_data = glove_receiver.get_data()
-
-                if skeleton_data is not None and not glove_connected:
-                    print(f"\n[信息] 成功与 MANUS 穿戴套件建立心跳反馈!")
-                    glove_connected = True
-
-                if skeleton_data is not None:
-                    ik_positions = ryhand_ik.compute_ik(skeleton_data)
-                    if ik_positions is not None:
-                        hand_angles = ik_to_hand_angles(ik_positions)
-                        current_hand_action = hand_angles.astype(np.float32)
-
-                        # >>> 发送关节角到真实灵巧手 <<<
-                        if hand_ctrl is not None:
-                            hand_ctrl.set_angles(hand_angles, speed=HAND_MOTOR_SPEED, radians=True)
-                else:
-                    if not glove_connected:
-                        pass  # 静默等待
-
-            # ==============================================================
-            # B) 机械臂控制 — 离合激活时跟随 T265 (与 tests/test_teleop_manus.py 一致)
-            # ==============================================================
-            if t265_pipeline is not None:
-                frames = t265_pipeline.poll_for_frames()
-                if frames:
-                    pose_frame = frames.get_pose_frame()
-                    if pose_frame:
-                        pose_data = pose_frame.get_pose_data()
-                        current_t265_matrix = create_pose_matrix(
-                            pose_data.translation, pose_data.rotation)
-
-                        # --- 离合控制 (机械臂跟随) ---
-                        if state.is_clutch_active and ur_arm is not None:
-                            if not was_clutch_active:
-                                # 刚接合: 记录离合基准
-                                clutch_t265_matrix = current_t265_matrix.copy()
-                                clutch_ur_matrix = pose_vector_to_matrix(
-                                    ur_arm.rtde_r.getActualTCPPose())
-                                was_clutch_active = True
-
-                            if base_t265_matrix is not None and base_ur_matrix is not None:
-                                # 旋转增量
-                                rot_delta_t265 = np.linalg.inv(base_t265_matrix) @ current_t265_matrix
-                                rot_delta_t265[:3, 3] = 0
-                                mapped_rot_delta = T265_TO_UR_ALIGN @ rot_delta_t265 @ T265_TO_UR_ALIGN.T
-                                mapped_rot_vec = R.from_matrix(mapped_rot_delta[:3, :3]).as_rotvec()
-
-                                # 自定义旋转轴校准 (与 tests/test_teleop_manus.py 一致)
-                                adj_ry = -mapped_rot_vec[1]
-                                adj_rx = mapped_rot_vec[2]
-                                adj_rz = mapped_rot_vec[0]
-                                adjusted_rot_delta_matrix = R.from_rotvec(
-                                    [adj_rx, adj_ry, adj_rz]).as_matrix()
-
-                                target_rotation = base_ur_matrix[:3, :3] @ adjusted_rot_delta_matrix
-
-                                # 平移增量
-                                trans_delta_t265 = (current_t265_matrix[:3, 3]
-                                                    - clutch_t265_matrix[:3, 3])
-                                mapped_trans_delta = (T265_TO_UR_ALIGN[:3, :3]
-                                                      @ trans_delta_t265 * TRANSLATION_SCALE)
-
-                                target_ur_matrix = np.eye(4)
-                                target_ur_matrix[:3, :3] = target_rotation
-                                target_ur_matrix[:3, 3] = clutch_ur_matrix[:3, 3] + mapped_trans_delta
-
-                                # >>> 发送 servoL 到机械臂 <<<
-                                try:
-                                    ur_arm.rtde_c.servoL(
-                                        matrix_to_pose_vector(target_ur_matrix),
-                                        SERVO_SPEED, SERVO_ACCEL, SERVO_DT, SERVO_LOOKAHEAD, SERVO_GAIN)
-                                except Exception:
-                                    pass
-                        else:
-                            if was_clutch_active:
-                                # 刚解除离合
-                                if ur_arm is not None:
-                                    try:
-                                        ur_arm.rtde_c.servoStop()
-                                    except Exception:
-                                        pass
-                                was_clutch_active = False
-
-            # ==============================================================
-            # C) 非录制 → 录制刚结束时写入 episode
-            # ==============================================================
+            # ------ Episode flush on recording stop ------
             if not state.is_recording:
-                if ep_arm_eef:
+                if ep_arm_eef: 
                     _flush_episode()
-                    ep_arm_eef.clear()
-                    ep_hand_joints.clear()
-                    ep_camera_env.clear()
-                    ep_camera_wrist.clear()
-                    ep_action_hand.clear()
-                    ep_action_delta.clear()
+                    _clear_episode_buffers()
                     prev_arm_pose_for_delta = None
 
-                # 空闲时显示状态 (低频刷新避免刷屏)
-                if int(start_time * 2) % 2 == 0:
+                if int(iter_start * 2) % 2 == 0:
                     clutch_str = "ENGAGED" if state.is_clutch_active else "DISENGAGED"
+                    overruns = ctrl_thread._loop_overrun_count
                     print(f"\r[IDLE] Ep: {total_episodes} | 步: {total_steps} | "
-                          f"离合: {clutch_str} | 按 's' 开始录制", end="")
+                          f"离合: {clutch_str} | "
+                          f"ctrl overruns: {overruns} | "
+                          f"按 's' 开始录制", end="")
 
-            # ==============================================================
-            # D) 录制中: 按 record_rate 频率采样一帧数据
-            # ==============================================================
+            # ------ Record one data frame ------
             if state.is_recording:
                 now = time.time()
                 if now - last_record_time >= record_interval:
                     last_record_time = now
 
-                    # (1) UR 机械臂末端位姿 (观测)
+                    # (1) UR TCP pose (RTDE receive — separate from control's rtde_c)
                     arm_pose = np.zeros(6, dtype=np.float32)
                     if ur_arm is not None:
                         try:
@@ -928,16 +988,17 @@ def main():
                         except Exception:
                             pass
 
-                    # (2) Ruiyan 灵巧手关节角 (观测)
+                    # (2) Hand joint angles (CAN read — locked against control's CAN write)
                     hand_angles_obs = np.zeros(15, dtype=np.float32)
                     if hand_ctrl is not None:
                         try:
-                            hand_angles_obs = hand_ctrl.get_angles(radians=True).astype(np.float32)
+                            with ctrl_thread.hand_hw_lock:
+                                hand_angles_obs = hand_ctrl.get_angles(
+                                    radians=True).astype(np.float32)
                         except Exception:
                             pass
 
-                    # (3) RealSense 相机画面 (观测)
-                    # Env 相机
+                    # (3) Camera frames (from RealSenseWorker threads — non-blocking)
                     env_img = np.zeros((img_h, img_w, 3), dtype=np.uint8)
                     if rs_env_camera is not None:
                         frame = rs_env_camera.get_latest_frame()
@@ -946,7 +1007,6 @@ def main():
                                 frame = cv2.resize(frame, (img_w, img_h))
                             env_img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                    # Wrist 相机 (安装时上下翻转，旋转 180° 校正)
                     wrist_img = np.zeros((img_h, img_w, 3), dtype=np.uint8)
                     if rs_wrist_camera is not None:
                         frame = rs_wrist_camera.get_latest_frame()
@@ -956,20 +1016,19 @@ def main():
                                 frame = cv2.resize(frame, (img_w, img_h))
                             wrist_img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                    # (4) 手套 retarget 关节角 (动作)
-                    action_hand = current_hand_action.copy()
+                    # (4) Hand action (from control thread snapshot)
+                    action_hand = ctrl_thread.get_hand_action()
 
-                    # (5) UR 末端位姿增量 (动作) — 从实际 UR TCP 位姿计算
-                    #     delta = inv(prev_pose) @ curr_pose  (body-frame 相对变换)
+                    # (5) EEF delta
                     action_delta = np.zeros(6, dtype=np.float32)
                     curr_arm_mat = pose_vector_to_matrix(arm_pose)
                     if prev_arm_pose_for_delta is not None:
-                        delta_mat = np.linalg.inv(prev_arm_pose_for_delta) @ curr_arm_mat
-                        action_delta = np.array(matrix_to_pose_vector(delta_mat),
-                                                dtype=np.float32)
+                        delta_mat = np.linalg.inv(
+                            prev_arm_pose_for_delta) @ curr_arm_mat
+                        action_delta = np.array(
+                            matrix_to_pose_vector(delta_mat), dtype=np.float32)
                     prev_arm_pose_for_delta = curr_arm_mat.copy()
 
-                    # 追加到 episode 缓冲
                     ep_arm_eef.append(arm_pose)
                     ep_hand_joints.append(hand_angles_obs)
                     ep_camera_env.append(env_img)
@@ -979,49 +1038,53 @@ def main():
 
                     step_in_ep = len(ep_arm_eef)
                     clutch_str = "ON" if state.is_clutch_active else "OFF"
-                    print(f"\r[REC] Ep {total_episodes + 1} | 步: {step_in_ep} | "
-                          f"离合: {clutch_str} | "
-                          f"arm: [{arm_pose[0]:.3f},{arm_pose[1]:.3f},{arm_pose[2]:.3f}] | "
-                          f"hand: {np.rad2deg(hand_angles_obs[:3]).astype(int)} | "
-                          f"delta: [{action_delta[0]:.4f},{action_delta[1]:.4f},{action_delta[2]:.4f}]",
-                          end="")
+                    print(
+                        f"\r[REC] Ep {total_episodes + 1} | 步: {step_in_ep} | "
+                        f"离合: {clutch_str} | "
+                        f"arm: [{arm_pose[0]:.3f},{arm_pose[1]:.3f},"
+                        f"{arm_pose[2]:.3f}] | "
+                        f"hand: {np.rad2deg(hand_angles_obs[:3]).astype(int)} | "
+                        f"delta: [{action_delta[0]:.4f},{action_delta[1]:.4f},"
+                        f"{action_delta[2]:.4f}]",
+                        end="")
 
-            # --- 频率控制 ---
-            elapsed = time.time() - start_time
-            if elapsed < control_dt:
-                time.sleep(control_dt - elapsed)
+            # Main thread sleeps at record_rate when recording, or a modest
+            # idle rate otherwise. The control thread runs independently.
+            sleep_target = record_interval if state.is_recording else 0.05
+            elapsed = time.time() - iter_start
+            if elapsed < sleep_target:
+                time.sleep(sleep_target - elapsed)
 
     except KeyboardInterrupt:
         print("\n\n[!] Ctrl+C 收到，准备保存并退出...")
 
     # ====================================================================
-    # 6. 清理与保存
+    # 7. 清理与保存
     # ====================================================================
+    state.request_quit()
+
     print("\n" + "=" * 70)
 
-    # --- 6a. 立即停止机械臂伺服 (最高优先级，防止意外运动) ---
     if ur_arm is not None:
         try:
             ur_arm.rtde_c.servoStop()
         except Exception:
             pass
 
-    # --- 6b. 键盘监听停止 (防止后续清理中的按键干扰) ---
     kb_listener.stop()
 
-    # --- 6c. 写入未完成的 episode ---
     print("正在保存数据集...")
     if ep_arm_eef:
         _flush_episode()
 
-    # --- 6d. 关闭硬件 (按依赖关系从外到内) ---
     print("正在关闭硬件连接...")
 
-    # 灵巧手: 先发送归零指令，等待到位后再关闭 CAN 总线
     if hand_ctrl is not None:
         try:
             print("  [系统] 灵巧手归零中...")
-            hand_ctrl.set_angles(np.zeros(15), speed=HAND_RESET_SPEED, radians=True)
+            with ctrl_thread.hand_hw_lock:
+                hand_ctrl.set_angles(
+                    np.zeros(15), speed=HAND_RESET_SPEED, radians=True)
             time.sleep(0.5)
         except Exception as e:
             print(f"  [!] 灵巧手归零失败: {e}")
@@ -1031,7 +1094,6 @@ def main():
         except Exception:
             pass
 
-    # 机械臂: 完全停止
     if ur_arm is not None:
         try:
             ur_arm.stop()
@@ -1039,7 +1101,6 @@ def main():
         except Exception:
             pass
 
-    # 相机: 停止采集线程
     for cam_label, cam in [("Env", rs_env_camera), ("Wrist", rs_wrist_camera)]:
         if cam is not None:
             try:
@@ -1048,7 +1109,6 @@ def main():
             except Exception:
                 pass
 
-    # T265: 停止追踪
     if t265_pipeline is not None:
         try:
             t265_pipeline.stop()
@@ -1056,7 +1116,6 @@ def main():
         except Exception:
             pass
 
-    # 手套 + IK: 释放 ZMQ / PyBullet 资源
     if glove_receiver is not None:
         try:
             glove_receiver.close()
@@ -1068,7 +1127,9 @@ def main():
         except Exception:
             pass
 
-    # --- 6e. 打印数据集摘要 ---
+    overruns = ctrl_thread._loop_overrun_count
+    print(f"\n  [统计] 控制线程循环超时次数: {overruns}")
+
     print("\n" + "=" * 70)
     print("数据集摘要:")
     print(f"  路径          : {args.output}")
@@ -1095,10 +1156,10 @@ def main():
         print("=" * 70)
         print("数据集保存完毕!")
 
-    # --- 6f. 验证 ---
     if total_episodes > 0:
         try:
-            sys.path.insert(0, os.path.join(project_root, "external", "diffusion_policy"))
+            sys.path.insert(0, os.path.join(
+                project_root, "external", "diffusion_policy"))
             from diffusion_policy.common.replay_buffer import ReplayBuffer
             rb = ReplayBuffer.create_from_path(args.output, mode='r')
             print(f"\n[验证] ReplayBuffer 读取成功:")
@@ -1108,7 +1169,6 @@ def main():
         except Exception as e:
             print(f"\n[验证] ReplayBuffer 读取测试: {e}")
 
-    # --- 6g. 无 episode 时移除空 zarr 目录 ---
     if total_episodes == 0:
         out_abs = os.path.abspath(os.path.expanduser(args.output))
         try:
